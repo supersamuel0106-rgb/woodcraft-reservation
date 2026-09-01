@@ -194,6 +194,22 @@
     }
 
     // ============================================================
+    // 1d. 老師與助教 (管理員) 權限名單
+    // ============================================================
+    // NOTE: 目前指定 supersamuel0106@gmail.com 為管理員；
+    //       未來若取得其他老師或助教的 Email，直接在此陣列加入即可！
+    const ADMIN_EMAILS = [
+      'supersamuel0106@gmail.com'
+    ];
+
+    function isTeacherOrTA(user) {
+      if (!user) return false;
+      if (user.role === 'admin' || user.role === 'teacher' || user.role === 'ta') return true;
+      if (user.mail && ADMIN_EMAILS.map(e => e.toLowerCase()).includes(user.mail.trim().toLowerCase())) return true;
+      return false;
+    }
+
+    // ============================================================
     // 2. 核心計算公式 (Domain Rules)
     // ============================================================
     function calculateUsageMinutes(studentCount) {
@@ -1955,6 +1971,16 @@
       // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
       const [selectedMachine, setSelectedMachine] = useState(null);
 
+      // NOTE: 檢查目前登入者是否為老師 / 助教 / 管理員 (例如 supersamuel0106@gmail.com)
+      const isAdmin = isTeacherOrTA(activeUser);
+
+      // 若非管理員且當前在管理頁面，自動切回機台列表
+      useEffect(() => {
+        if (!isAdmin && (activeTab === 'courses' || activeTab === 'settings')) {
+          setActiveTab('machines');
+        }
+      }, [isAdmin, activeTab, setActiveTab]);
+
       const openModal = (id) => {
         setSelectedMacId(id || null);
         setIsResModalOpen(true);
@@ -2011,7 +2037,7 @@
                     {getTitle()}
                   </h2>
                   <span className="text-[10px] text-slate-500 font-semibold block">
-                    👤 {activeUser.name} ({activeUser.mail})
+                    👤 {activeUser.name} ({activeUser.mail}) {isAdmin ? '👑 老師/助教' : '🎓 學生'}
                   </span>
                 </div>
               </div>
@@ -2049,17 +2075,19 @@
                 )
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
-              {activeTab === 'courses' && <CourseSessionsView />}
-              {activeTab === 'settings' && <BookingSettingsView />}
+              {isAdmin && activeTab === 'courses' && <CourseSessionsView />}
+              {isAdmin && activeTab === 'settings' && <BookingSettingsView />}
             </div>
 
-            {/* 底部導覽列 */}
+            {/* 底部導覽列 (依權限動態顯示) */}
             <div className="h-16 bg-white border-t border-slate-200 flex items-center justify-around z-20 select-none shadow-lg">
               {[
                 { id: 'machines', label: '機台列表', icon: '🪚' },
                 { id: 'reservations', label: '我的預約', icon: '📋' },
-                { id: 'courses', label: '課程場次', icon: '📚' },
-                { id: 'settings', label: '預約設定', icon: '⚙️' }
+                ...(isAdmin ? [
+                  { id: 'courses', label: '課程場次', icon: '📚' },
+                  { id: 'settings', label: '預約設定', icon: '⚙️' }
+                ] : [])
               ].map(t => {
                 const active = activeTab === t.id;
                 return (
