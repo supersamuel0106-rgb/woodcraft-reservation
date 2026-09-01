@@ -683,6 +683,11 @@
       };
 
       const startMachineUsage = async (machineId, reservationId) => {
+        if (isCoursePaused) {
+          alert('⚠️ 目前課程暫停（老師講解中），機台暫停使用！請待老師恢復課程後再報到使用。');
+          return;
+        }
+
         let targetRes;
         if (reservationId) {
           targetRes = reservations.find(r => r.id === reservationId);
@@ -833,6 +838,99 @@
         };
       };
 
+      const [localPauseState, setLocalPauseState] = useState(() => {
+        try {
+          return JSON.parse(localStorage.getItem('wc_course_pause_state') || '{"isPaused":false}');
+        } catch {
+          return { isPaused: false };
+        }
+      });
+
+      // 是否暫停中（優先看 systemSettings 或 local state）
+      const isCoursePaused = !!(systemSettings?.course_paused || localPauseState.isPaused);
+      const coursePausedAt = systemSettings?.course_paused_at || localPauseState.pausedAt || null;
+
+      const pauseCourse = async (notes = '老師講解中') => {
+        const pauseObj = {
+          isPaused: true,
+          pausedAt: new Date().toISOString(),
+          notes
+        };
+        setLocalPauseState(pauseObj);
+        localStorage.setItem('wc_course_pause_state', JSON.stringify(pauseObj));
+
+        try {
+          await supabaseClient.from('system_settings').update({
+            course_paused: true,
+            course_paused_at: pauseObj.pausedAt
+          }).eq('id', 'DEFAULT');
+        } catch (e) {
+          console.warn('Supabase pause update note:', e);
+        }
+
+        const notif = {
+          id: `N_${Date.now()}`,
+          timestamp: new Date().toLocaleTimeString('zh-TW'),
+          recipientName: '全體師生',
+          machineName: '全機台',
+          subject: '【課程暫停】老師講解中',
+          body: `老師已啟動課程暫停（講解進行中），所有機台操作暫停，時段將於講解結束後自動往後順延！`
+        };
+        setNotifications(prev => [notif, ...prev]);
+        await refreshData();
+      };
+
+      const resumeCourse = async () => {
+        const pausedAtStr = coursePausedAt || new Date().toISOString();
+        const pausedAt = new Date(pausedAtStr);
+        const now = new Date();
+        const diffMs = Math.max(0, now.getTime() - pausedAt.getTime());
+        // 向上取整至少 1 分鐘
+        const elapsedMin = Math.max(1, Math.ceil(diffMs / (1000 * 60)));
+
+        // 找出所有需要順延的預約（使用中、等候報到、排隊中、等待中）
+        const activeList = reservations.filter(r => 
+          r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中'
+        );
+
+        // 順延預約時段
+        for (const r of activeList) {
+          const newStart = r.startMinutes + elapsedMin;
+          const newEnd = r.endMinutes + elapsedMin;
+          await supabaseClient.from('reservations').update({
+            start_minutes: newStart,
+            end_minutes: newEnd,
+            start_time_formatted: minutesToTime(newStart),
+            end_time_formatted: minutesToTime(newEnd)
+          }).eq('id', r.id);
+        }
+
+        setLocalPauseState({ isPaused: false });
+        localStorage.removeItem('wc_course_pause_state');
+
+        try {
+          await supabaseClient.from('system_settings').update({
+            course_paused: false,
+            course_paused_at: null
+          }).eq('id', 'DEFAULT');
+        } catch (e) {
+          console.warn('Supabase resume update note:', e);
+        }
+
+        const notif = {
+          id: `N_${Date.now()}`,
+          timestamp: new Date().toLocaleTimeString('zh-TW'),
+          recipientName: '全體師生',
+          machineName: '全機台',
+          subject: '【課程已恢復】時段已自動順延',
+          body: `老師講解結束，課程已恢復！所有進行中與排隊中的預約已自動往後順延 ${elapsedMin} 分鐘。`
+        };
+        setNotifications(prev => [notif, ...prev]);
+
+        await refreshData();
+        return { success: true, elapsedMin, count: activeList.length };
+      };
+
       const setCurrentCourseSession = async (sessId) => {
         await supabaseClient.from('course_sessions').update({ is_current: false }).neq('id', '00000000-0000-0000-0000-000000000000');
         await supabaseClient.from('course_sessions').update({ is_current: true }).eq('id', sessId);
@@ -857,6 +955,10 @@
           activeTab,
           isLiveSupabase,
           isLoading,
+          isCoursePaused,
+          coursePausedAt,
+          pauseCourse,
+          resumeCourse,
           setActiveTab,
           setActiveUser,
           loginWithEmail,
@@ -1720,39 +1822,161 @@
     }
 
     // ============================================================
-    // 9. 課程場次 (CourseSessionsView) - 1:1 截圖 3
+    // 9. 課程場次 (CourseSessionsView) - 支援課程暫停計時與時段順延控制
     // ============================================================
     function CourseSessionsView() {
-      const { courseSessions, setCurrentCourseSession } = useApp();
+      const { courseSessions, setCurrentCourseSession, isCoursePaused, coursePausedAt, pauseCourse, resumeCourse } = useApp();
+      const [isProcessing, setIsProcessing] = useState(false);
+      const [elapsedSec, setElapsedSec] = useState(0);
+
+      // 動態計時碼表：暫停中時每秒跳動
+      useEffect(() => {
+        if (!isCoursePaused || !coursePausedAt) {
+          setElapsedSec(0);
+          return;
+        }
+        const updateTimer = () => {
+          const diff = Math.max(0, Math.floor((Date.now() - new Date(coursePausedAt).getTime()) / 1000));
+          setElapsedSec(diff);
+        };
+        updateTimer();
+        const interval = setInterval(updateTimer, 1000);
+        return () => clearInterval(interval);
+      }, [isCoursePaused, coursePausedAt]);
+
+      const formatStopwatch = (totalSec) => {
+        const mm = Math.floor(totalSec / 60).toString().padStart(2, '0');
+        const ss = (totalSec % 60).toString().padStart(2, '0');
+        return `${mm}:${ss}`;
+      };
+
+      const handlePause = async () => {
+        const ok = window.confirm('確定要暫停課程（開始講解計時）嗎？\n\n• 系統將即時停止所有同學的機台操作與報到。\n• 恢復課程時，所有預約將依暫停的時間自動往後順延！');
+        if (!ok) return;
+        setIsProcessing(true);
+        try {
+          await pauseCourse('老師講解中');
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+
+      const handleResume = async () => {
+        const estMin = Math.max(1, Math.ceil(elapsedSec / 60));
+        const ok = window.confirm(`確定要恢復課程嗎？\n\n目前已暫停約 ${estMin} 分鐘，恢復後系統將自動把所有進行中與排隊中的預約時段往後順延 ${estMin} 分鐘！`);
+        if (!ok) return;
+        setIsProcessing(true);
+        try {
+          const res = await resumeCourse();
+          alert(`✅ 課程已順利恢復！\n\n共將 ${res.count} 筆預約時段自動往後順延 ${res.elapsedMin} 分鐘。`);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
 
       return (
-        <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100 overflow-hidden shadow-xs">
-          {courseSessions.map(session => (
-            <div key={session.id} className="p-4 flex items-center justify-between hover:bg-slate-50">
-              <div className="space-y-1">
-                <span className={`inline-block text-xs font-bold px-2 py-0.5 rounded ${session.isCurrent ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
-                  {session.isCurrent ? 'Y' : 'N'}
-                </span>
-                <h4 className="text-base font-bold text-slate-800">
-                  {session.notes || `${session.sessionId}：${session.startTime.substring(0,5)}－${session.endTime.substring(0,5)}`}
-                </h4>
+        <div className="space-y-4">
+          {/* NOTE: 老師/助教專用 —— 課程暫停與講解控制卡片 */}
+          <div className={`p-5 rounded-3xl border transition-all shadow-xs ${
+            isCoursePaused 
+              ? 'bg-amber-50 border-amber-300 ring-2 ring-amber-400/50' 
+              : 'bg-white border-slate-200'
+          }`}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">{isCoursePaused ? '⏸️' : '⏱️'}</span>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 leading-tight">課程暫停與講解控制</h3>
+                  <p className="text-[11px] text-slate-500 font-semibold mt-0.5">老師講解示範時可暫停預約並自動順延</p>
+                </div>
               </div>
+              <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+                isCoursePaused 
+                  ? 'bg-amber-100 border-amber-300 text-amber-800 animate-pulse' 
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+              }`}>
+                {isCoursePaused ? '⏸️ 講解暫停中' : '🟢 課程進行中'}
+              </span>
+            </div>
 
-              <div className="flex items-center gap-2 text-slate-500">
-                <button onClick={() => alert('預設場次不可刪除')} className="p-2 hover:text-red-600">🗑️</button>
-                <button onClick={() => alert(`編輯【${session.sessionId}】`)} className="p-2 hover:text-blue-600">✏️</button>
-                <button 
-                  onClick={() => {
-                    setCurrentCourseSession(session.id);
-                    alert(`已呼叫系統設定同步：設【${session.sessionId}】為目前場次！`);
-                  }}
-                  className={`p-2 ${session.isCurrent ? 'text-emerald-600 font-bold' : 'hover:text-emerald-600'}`}
+            {isCoursePaused ? (
+              <div className="space-y-4">
+                {/* 碼表大計時器 */}
+                <div className="bg-white/90 border border-amber-200 rounded-2xl p-4 text-center">
+                  <div className="text-[11px] font-bold text-amber-700 uppercase tracking-wider mb-1">
+                    ⏱️ 講解已暫停時間
+                  </div>
+                  <div className="font-mono text-3xl font-extrabold text-amber-900 tracking-wider">
+                    {formatStopwatch(elapsedSec)}
+                  </div>
+                  <div className="text-[10px] text-amber-600 font-semibold mt-1">
+                    （每滿 1 分鐘時段將自動往後遞延 1 分鐘）
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={handleResume}
+                  className="w-full py-3.5 px-4 rounded-2xl bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white text-sm font-bold shadow-md shadow-emerald-500/25 flex items-center justify-center gap-2 transition-all cursor-pointer"
                 >
-                  ✓
+                  <span className="text-base">▶️</span>
+                  <span>{isProcessing ? '正在計算並順延時段...' : '恢復課程（結束講解並自動順延）'}</span>
                 </button>
               </div>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-xs text-slate-600 leading-relaxed bg-slate-50 p-3 rounded-2xl border border-slate-100">
+                  💡 <strong>使用說明：</strong>當需要集合全班講解時，點擊下方按鈕啟動暫停。系統將即時碼表計時，待講解結束恢復時，所有排隊與時段將<strong>精準往後順延</strong>。
+                </p>
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={handlePause}
+                  className="w-full py-3.5 px-4 rounded-2xl bg-amber-500 hover:bg-amber-600 active:scale-[0.98] text-white text-sm font-bold shadow-md shadow-amber-500/20 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  <span className="text-base">⏸️</span>
+                  <span>{isProcessing ? '啟動暫停中...' : '暫停課程（開始講解計時）'}</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* 場次清單卡片 */}
+          <div className="bg-white rounded-3xl border border-slate-200 divide-y divide-slate-100 overflow-hidden shadow-xs">
+            <div className="px-5 py-3.5 bg-slate-50/80 border-b border-slate-100 flex items-center justify-between">
+              <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                <span>📚</span> 課程預設時段場次
+              </h4>
+              <span className="text-[10px] text-slate-400 font-semibold">點擊 ✓ 切換目前場次</span>
             </div>
-          ))}
+            {courseSessions.map(session => (
+              <div key={session.id} className="p-4 flex items-center justify-between hover:bg-slate-50">
+                <div className="space-y-1">
+                  <span className={`inline-block text-xs font-bold px-2 py-0.5 rounded ${session.isCurrent ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
+                    {session.isCurrent ? 'Y' : 'N'}
+                  </span>
+                  <h4 className="text-base font-bold text-slate-800">
+                    {session.notes || `${session.sessionId}：${session.startTime.substring(0,5)}－${session.endTime.substring(0,5)}`}
+                  </h4>
+                </div>
+
+                <div className="flex items-center gap-2 text-slate-500">
+                  <button onClick={() => alert('預設場次不可刪除')} className="p-2 hover:text-red-600">🗑️</button>
+                  <button onClick={() => alert(`編輯【${session.sessionId}】`)} className="p-2 hover:text-blue-600">✏️</button>
+                  <button 
+                    onClick={() => {
+                      setCurrentCourseSession(session.id);
+                      alert(`已呼叫系統設定同步：設【${session.sessionId}】為目前場次！`);
+                    }}
+                    className={`p-2 ${session.isCurrent ? 'text-emerald-600 font-bold' : 'hover:text-emerald-600'}`}
+                  >
+                    ✓
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       );
     }
@@ -1965,7 +2189,7 @@
     // 11. 主畫面排版 (MainLayout) - 純手機 App 排版 (Mobile-Only)
     // ============================================================
     function MainLayout() {
-      const { machines, activeTab, setActiveTab, activeUser, isLoggedIn, logout, refreshData } = useApp();
+      const { machines, activeTab, setActiveTab, activeUser, isLoggedIn, logout, refreshData, isCoursePaused, coursePausedAt } = useApp();
       const [isResModalOpen, setIsResModalOpen] = useState(false);
       const [selectedMacId, setSelectedMacId] = useState(null);
       // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
@@ -2052,6 +2276,19 @@
                 )}
               </div>
             </div>
+
+            {/* NOTE: 課程暫停全域醒目廣播 Banner (對所有頁面與所有師生可見) */}
+            {isCoursePaused && (
+              <div className="bg-gradient-to-r from-amber-500 to-orange-500 text-white px-4 py-2.5 flex items-center justify-between text-xs font-bold shadow-md z-20 select-none">
+                <div className="flex items-center gap-2">
+                  <span className="text-base animate-bounce">⏸️</span>
+                  <div>
+                    <div>【老師講解示範中】課程暫停</div>
+                    <div className="text-[10px] font-normal opacity-90">所有機台暫停使用，時段將於講解後自動順延</div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* 內容區 */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-100/70">
