@@ -71,10 +71,10 @@
     // ============================================================
     // NOTE: 請依照下方設定說明完成 EmailJS 帳號設定，再將對應值填入此處。
     //       未來若需要更換寄信 Gmail，只需在 EmailJS 後台重新連接即可，不用改程式碼。
-    const EMAILJS_PUBLIC_KEY    = 'YOUR_PUBLIC_KEY';       // EmailJS > Account > Public Key
-    const EMAILJS_SERVICE_ID    = 'YOUR_SERVICE_ID';       // EmailJS > Email Services > Service ID
-    const EMAILJS_TEMPLATE_ID   = 'YOUR_TEMPLATE_ID';      // EmailJS > Email Templates > Template ID
-    const EMAILJS_ENABLED = EMAILJS_PUBLIC_KEY !== 'YOUR_PUBLIC_KEY'; // 尚未設定時自動跳過
+    const EMAILJS_PUBLIC_KEY    = 'I2DLcYWgikVfuUwck';       // EmailJS > Account > Public Key
+    const EMAILJS_SERVICE_ID    = 'service_mo2q2ae';       // EmailJS > Email Services > Service ID
+    const EMAILJS_TEMPLATE_ID   = 'template_3mo7121';      // EmailJS > Email Templates > Template ID
+    const EMAILJS_ENABLED = EMAILJS_PUBLIC_KEY !== 'YOUR_PUBLIC_KEY' && EMAILJS_TEMPLATE_ID !== 'YOUR_TEMPLATE_ID'; // 尚未設定時自動跳過
 
     // EmailJS 初始化（僅於設定完成後執行）
     if (EMAILJS_ENABLED && window.emailjs) {
