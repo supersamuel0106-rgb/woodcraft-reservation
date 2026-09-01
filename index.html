@@ -23,6 +23,9 @@
   <!-- Babel Standalone -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
+  <!-- EmailJS SDK（用於叫號與時段提醒 Email 通知）-->
+  <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+
   <style>
     body {
       font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -62,6 +65,133 @@
     const SUPABASE_ANON_KEY = 'sb_publishable_6AavmvJ1L-BFXXisShqFvA_ikn_mnSY';
     const AUTH_STORAGE_KEY = 'factory_v04_logged_in_email';
     const supabaseClient = window.supabase?.createClient ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+    // ============================================================
+    // 1b. EmailJS 通知設定（★ 請於 emailjs.com 設定完成後填入以下金鑰 ★）
+    // ============================================================
+    // NOTE: 請依照下方設定說明完成 EmailJS 帳號設定，再將對應值填入此處。
+    //       未來若需要更換寄信 Gmail，只需在 EmailJS 後台重新連接即可，不用改程式碼。
+    const EMAILJS_PUBLIC_KEY    = 'YOUR_PUBLIC_KEY';       // EmailJS > Account > Public Key
+    const EMAILJS_SERVICE_ID    = 'YOUR_SERVICE_ID';       // EmailJS > Email Services > Service ID
+    const EMAILJS_TEMPLATE_ID   = 'YOUR_TEMPLATE_ID';      // EmailJS > Email Templates > Template ID
+    const EMAILJS_ENABLED = EMAILJS_PUBLIC_KEY !== 'YOUR_PUBLIC_KEY'; // 尚未設定時自動跳過
+
+    // EmailJS 初始化（僅於設定完成後執行）
+    if (EMAILJS_ENABLED && window.emailjs) {
+      window.emailjs.init({ publicKey: EMAILJS_PUBLIC_KEY });
+    }
+
+    // 已通知的提醒 ID 集合（防止重複推播，存於 localStorage）
+    const NOTIFIED_REMINDERS_KEY = 'wc_notified_reminders_v1';
+
+    // ============================================================
+    // 1c. 通知工具函式（瀏覽器推播 + Email）
+    // ============================================================
+
+    /**
+     * 請求瀏覽器通知授權
+     * 於使用者登入後呼叫，讓系統可在叫號時推播手機/桌面通知
+     */
+    async function requestNotificationPermission() {
+      if (!('Notification' in window)) return;
+      if (Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+    }
+
+    /**
+     * 發送瀏覽器系統推播通知（App 開著或在背景分頁時均可收到）
+     * @param {string} title - 通知標題
+     * @param {string} body  - 通知內容
+     * @param {string} tag   - 通知唯一標籤（相同 tag 會取代舊通知，避免重複）
+     */
+    function sendBrowserNotification(title, body, tag) {
+      if (!('Notification' in window)) return;
+      if (Notification.permission !== 'granted') return;
+      try {
+        new Notification(title, {
+          body,
+          tag,
+          icon: 'https://woodcraft-reservation.vercel.app/favicon.ico',
+          requireInteraction: true // 通知不會自動消失，需要使用者手動關閉
+        });
+      } catch (e) {
+        console.warn('Browser notification failed:', e);
+      }
+    }
+
+    /**
+     * 發送 EmailJS Email 通知
+     * 若 EmailJS 未設定或寄送失敗（例如扣打用完），靜默略過不影響系統運作
+     * @param {object} params - EmailJS 模板參數
+     */
+    async function sendEmailNotification(params) {
+      if (!EMAILJS_ENABLED || !window.emailjs) return;
+      try {
+        await window.emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, params);
+        console.info('[EmailJS] 已成功寄送通知至', params.to_email);
+      } catch (err) {
+        // NOTE: 扣打用完或其他錯誤時靜默略過，不影響系統正常使用
+        console.warn('[EmailJS] 寄送失敗（可能扣打已用完或設定尚未完成）:', err);
+      }
+    }
+
+    /**
+     * 發送叫號通知（瀏覽器推播 + Email 二合一）
+     * 當前一位同學結束使用，系統自動對下一位被叫號的同學發送通知
+     */
+    async function sendQueueCallNotification({ studentNames, machineName, startTime, endTime, durationMinutes, toEmail }) {
+      const title = `【輪到您了！🎟️】${machineName}`;
+      const body = `${studentNames}，您的機台已可使用！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n請於 5 分鐘內前往工廠報到，逾時將視為放棄。`;
+      const tag = `queue-call-${toEmail}-${Date.now()}`;
+
+      sendBrowserNotification(title, body, tag);
+
+      await sendEmailNotification({
+        to_email: toEmail,
+        to_name: studentNames,
+        subject: `【叫號通知】${machineName} 輪到您使用了！`,
+        machine_name: machineName,
+        start_time: startTime,
+        end_time: endTime,
+        duration_minutes: durationMinutes,
+        message: body,
+        notification_type: '叫號通知'
+      });
+    }
+
+    /**
+     * 發送時段前 5 分鐘提醒通知（瀏覽器推播 + Email 二合一）
+     * 由前端輪詢機制每 30 秒掃描一次即將開始的預約
+     */
+    async function sendReminderNotification({ studentNames, machineName, startTime, endTime, durationMinutes, toEmail, reservationId }) {
+      // 防止重複推播
+      const notified = JSON.parse(localStorage.getItem(NOTIFIED_REMINDERS_KEY) || '{}');
+      const notifKey = `${reservationId}_5min`;
+      if (notified[notifKey]) return;
+
+      const title = `【即將開始！⏰】${machineName}`;
+      const body = `${studentNames}，您的機台預約 5 分鐘後開始！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n請準備前往工廠！`;
+      const tag = `reminder-${reservationId}`;
+
+      sendBrowserNotification(title, body, tag);
+
+      await sendEmailNotification({
+        to_email: toEmail,
+        to_name: studentNames,
+        subject: `【時段提醒】${machineName} 即將於 ${startTime} 開始！`,
+        machine_name: machineName,
+        start_time: startTime,
+        end_time: endTime,
+        duration_minutes: durationMinutes,
+        message: body,
+        notification_type: '5分鐘提醒'
+      });
+
+      // 記錄已通知，避免重複
+      notified[notifKey] = Date.now();
+      localStorage.setItem(NOTIFIED_REMINDERS_KEY, JSON.stringify(notified));
+    }
 
     // ============================================================
     // 2. 核心計算公式 (Domain Rules)
@@ -321,6 +451,42 @@
         return () => clearInterval(timer);
       }, [refreshData]);
 
+      // NOTE: 每 30 秒掃描一次，對距離開始 4~6 分鐘內的預約發送「時段前 5 分鐘提醒」通知
+      // 僅通知目前登入者自己的預約，並用 localStorage 防止重複推播
+      useEffect(() => {
+        const checkReminders = () => {
+          if (!isLoggedIn || !activeUser.mail) return;
+          const now = new Date();
+          const currentMin = now.getHours() * 60 + now.getMinutes();
+
+          reservations.forEach(r => {
+            // 只通知當前登入者的預約
+            if (r.email !== activeUser.mail) return;
+            // 只通知尚未開始的排隊或等候報到
+            if (r.status !== '排隊中' && r.status !== '等候報到') return;
+
+            const minutesUntilStart = r.startMinutes - currentMin;
+            // 在開始前 4~6 分鐘觸發（容許 30 秒輪詢誤差）
+            if (minutesUntilStart >= 4 && minutesUntilStart <= 6) {
+              sendReminderNotification({
+                studentNames: r.students.join(', '),
+                machineName: r.machineName,
+                startTime: r.startTimeFormatted,
+                endTime: r.endTimeFormatted,
+                durationMinutes: r.durationMinutes,
+                toEmail: r.email,
+                reservationId: r.id
+              });
+            }
+          });
+        };
+
+        // 立即執行一次，之後每 30 秒掃描
+        checkReminders();
+        const reminderTimer = setInterval(checkReminders, 30000);
+        return () => clearInterval(reminderTimer);
+      }, [reservations, isLoggedIn, activeUser]);
+
       const loginWithEmail = async (email) => {
         const trimmed = email.trim().toLowerCase();
         const matched = students.find(s => s.mail.toLowerCase() === trimmed);
@@ -335,6 +501,10 @@
         setActiveUser(matched);
         setIsLoggedIn(true);
         localStorage.setItem(AUTH_STORAGE_KEY, matched.mail);
+
+        // NOTE: 登入成功後請求瀏覽器通知授權，讓系統可推播叫號與時段提醒
+        requestNotificationPermission();
+
         return {
           success: true,
           message: `歡迎回來，${matched.name} ${matched.role === 'admin' ? '老師' : '同學'}！`
@@ -477,15 +647,25 @@
 
             await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
 
-            // 第一位推播叫號通知
+            // NOTE: 第一位被叫號者：同時發送瀏覽器推播通知 + EmailJS Email 通知
             if (isFirst) {
+              sendQueueCallNotification({
+                studentNames: item.students.join(', '),
+                machineName: item.machineName,
+                startTime: minutesToTime(newStartMin),
+                endTime: minutesToTime(newEndMin),
+                durationMinutes: item.durationMinutes,
+                toEmail: item.email || ''
+              });
+
+              // 同時保留 in-app 通知物件（顯示在通知列表中）
               const notif = {
                 id: `N_${Date.now()}`,
                 timestamp: new Date().toLocaleTimeString('zh-TW'),
                 recipientName: item.students.join(', '),
                 machineName: item.machineName,
                 subject: '【叫號通知】輪到您使用機台了！',
-                body: `親愛的 ${item.students.join(', ')} 同學：您預約的【${item.machineName}】目前已提早空出，時段已更新為 ${minutesToTime(newStartMin)} ～ ${minutesToTime(newEndMin)}，請於 5 分鐘內前往工廠報到使用！`
+                body: `親愛的 ${item.students.join(', ')} 同學：您預約的【${item.machineName}】時段已更新為 ${minutesToTime(newStartMin)} ～ ${minutesToTime(newEndMin)}，請於 5 分鐘內前往工廠報到！`
               };
               setNotifications(prev => [notif, ...prev]);
             }
