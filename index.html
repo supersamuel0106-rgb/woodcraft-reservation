@@ -308,6 +308,7 @@
       };
     }
 
+    // 檢查機台時段是否有衝突
     function hasReservationConflict(reservations, machineId, startMin, durationMin, ignoreId) {
       const endMin = startMin + durationMin;
       return reservations.some(r => {
@@ -318,30 +319,63 @@
       });
     }
 
-    function calculateDynamicQueueStart(reservations, machineId, durationMin = 20) {
+    // 檢查學生名單在「所有機台」中是否有同時段的衝突（同時間不可預約不同機台）
+    function findStudentConflict(reservations, students = [], userEmail = '', startMin = 0, durationMin = 0, ignoreId = null) {
+      const endMin = startMin + durationMin;
+      const studentSet = new Set(students || []);
+      return reservations.find(r => {
+        if (r.id === ignoreId) return false;
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        const hasOverlap = r.startMinutes < endMin && r.endMinutes > startMin;
+        if (!hasOverlap) return false;
+
+        const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+        const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
+        return isSameEmail || hasCommonStudent;
+      });
+    }
+
+    // 動態計算現場排隊起始時間（若學生在其他機台有排隊/使用中，自動往後順延避免時間衝突）
+    function calculateDynamicQueueStart(reservations, machineId, durationMin = 20, courseEndMin = 1020, students = [], userEmail = '') {
       const now = new Date();
       const currentMin = now.getHours() * 60 + now.getMinutes();
       const roundedNow = Math.ceil(currentMin / 10) * 10;
 
-      const activeRes = reservations.filter(r => 
+      // 1. 本機台現有有效隊列的最晚結束時間
+      const machineActiveRes = reservations.filter(r => 
         r.machineId === machineId && 
         (r.status === '排隊中' || r.status === '等待中' || r.status === '等候報到' || r.status === '使用中')
       );
-
-      let baseline = roundedNow;
-      if (activeRes.length > 0) {
-        const maxEnd = Math.max(...activeRes.map(r => r.endMinutes));
-        baseline = Math.max(roundedNow, maxEnd);
+      let machineBaseline = roundedNow;
+      if (machineActiveRes.length > 0) {
+        machineBaseline = Math.max(roundedNow, ...machineActiveRes.map(r => r.endMinutes));
       }
 
-      let cand = baseline;
-      while (cand + durationMin <= 1020) {
-        if (!hasReservationConflict(reservations, machineId, cand, durationMin)) {
+      // 2. 學生在「其他機台」的現有預約/排隊最晚結束時間（若有排其他機台，自動往後順延）
+      const studentSet = new Set(students || []);
+      const studentActiveRes = reservations.filter(r => {
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+        const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
+        return isSameEmail || hasCommonStudent;
+      });
+      let studentBaseline = roundedNow;
+      if (studentActiveRes.length > 0) {
+        studentBaseline = Math.max(roundedNow, ...studentActiveRes.map(r => r.endMinutes));
+      }
+
+      // 初始候選時間：取兩者中較晚者（保證機台空閒 且 同學有空）
+      let cand = Math.max(roundedNow, machineBaseline, studentBaseline);
+
+      while (cand + durationMin <= courseEndMin) {
+        const machineHit = hasReservationConflict(reservations, machineId, cand, durationMin);
+        const studentHit = findStudentConflict(reservations, students, userEmail, cand, durationMin);
+        if (!machineHit && !studentHit) {
           return cand;
         }
         cand += 10;
       }
-      return baseline;
+      return cand;
     }
 
     function getNextQueueWaiter(reservations, machineId) {
@@ -521,6 +555,36 @@
         if (!targetMac) return { success: false, message: '找不到機台' };
         if (data.students.length === 0) return { success: false, message: '請至少選一位學生' };
 
+        // 1. 取得目前登入者與選取學生名單中所有進行中的預約/排隊
+        const activeResList = reservations.filter(r => {
+          if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+          const isSameEmail = activeUser?.mail && r.email && r.email.toLowerCase() === activeUser.mail.toLowerCase();
+          const hasCommonStudent = (r.students || []).some(s => data.students.includes(s));
+          return isSameEmail || hasCommonStudent;
+        });
+
+        // 2. 限制條件 3：最多只能有 3 筆「時段預約」
+        if (data.type === '時段預約') {
+          const activeSlotCount = activeResList.filter(r => r.type === '時段預約').length;
+          if (activeSlotCount >= 3) {
+            return {
+              success: false,
+              message: `已達預約上限：您（或名單中同學）目前已有 ${activeSlotCount} 筆進行中的「時段預約」，每人最多只能同時預約 3 筆！`
+            };
+          }
+        }
+
+        // 3. 限制條件 4：最多只能有 3 筆「現場排隊」
+        if (data.type === '現場排隊') {
+          const activeQueueCount = activeResList.filter(r => r.type === '現場排隊').length;
+          if (activeQueueCount >= 3) {
+            return {
+              success: false,
+              message: `已達排隊上限：您（或名單中同學）目前已有 ${activeQueueCount} 筆進行中的「現場排隊」，每人最多只能同時排隊 3 筆！`
+            };
+          }
+        }
+
         // NOTE: 若使用者自選了時長（customDuration），以自選值為準；否則退回自動計算
         const duration = data.customDuration || calculateUsageMinutes(data.students.length);
         let startMin = 540;
@@ -529,11 +593,23 @@
         if (data.type === '時段預約') {
           if (!slotId) return { success: false, message: '請於時段矩陣選擇起始時段' };
           startMin = timeToMinutes(slotId);
+
+          // 限制條件 1：同一機台時段衝突檢查
           if (hasReservationConflict(reservations, data.machineId, startMin, duration)) {
-            return { success: false, message: `時段 ${slotId} 已被占用！` };
+            return { success: false, message: `時段衝突：該機台在 ${slotId} ～ ${minutesToTime(startMin + duration)} 已被預約！` };
+          }
+
+          // 限制條件 1：跨機台時段重疊檢查（同學同時間不可預約不同機台）
+          const studentConflict = findStudentConflict(reservations, data.students, activeUser?.mail, startMin, duration);
+          if (studentConflict) {
+            return {
+              success: false,
+              message: `跨機台時段衝突：名單中的同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約/排隊，同時間不可重複預約不同機台！`
+            };
           }
         } else {
-          startMin = calculateDynamicQueueStart(reservations, data.machineId, duration);
+          // 限制條件 2：現場排隊若有排其他機台，自動往後順延避免時間衝突
+          startMin = calculateDynamicQueueStart(reservations, data.machineId, duration, 1020, data.students, activeUser?.mail);
           slotId = null; // 現場排隊不綁定 time_slots 外鍵
         }
 
@@ -846,7 +922,7 @@
     // ============================================================
     const MINUTES_STEP = [0, 10, 20, 30, 40, 50];
 
-    function TimeTableMatrix({ machineId, minDuration, maxDuration, selectedStartSlot, selectedDuration, onSelectSlot, onSelectDuration }) {
+    function TimeTableMatrix({ machineId, minDuration, maxDuration, selectedStartSlot, selectedDuration, selectedStudents, userEmail, onSelectSlot, onSelectDuration }) {
       const { reservations, systemSettings } = useApp();
       const effectiveTimes = getEffectiveCourseTimes(systemSettings);
       const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
@@ -881,6 +957,7 @@
           return { status: 'selected', symbol: '●', label: timeLabel };
         }
 
+        // 1. 檢查本機台是否已被占用
         const isOccupied = reservations.some(r => {
           if (r.machineId !== machineId) return false;
           if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
@@ -890,6 +967,13 @@
         if (isOccupied) {
           return { status: 'occupied', symbol: '■', label: timeLabel };
         }
+
+        // 2. 檢查選定同學在其他機台是否已有預約（跨機台衝突）
+        const studentHit = findStudentConflict(reservations, selectedStudents, userEmail, slotMinutes, 10);
+        if (studentHit) {
+          return { status: 'student_busy', symbol: '▲', label: timeLabel, conflictMachine: studentHit.machineName };
+        }
+
         return { status: 'available', symbol: '○', label: timeLabel };
       };
 
@@ -915,9 +999,15 @@
             // 點選已選範圍「之後」：延長到該格（+10 分鐘）
             const newDuration = clickedOffset + 10;
             if (newDuration <= maxDuration) {
-              // 檢查延長範圍內是否有衝突
+              // 檢查延長範圍內是否有本機台衝突
               if (hasReservationConflict(reservations, machineId, selectedStartMinutes, newDuration)) {
-                alert(`時段衝突！延長到此格會與已有預約重疊，請選其他範圍。`);
+                alert(`時段衝突！延長到此格會與該機台已有預約重疊，請選其他範圍。`);
+                return;
+              }
+              // 檢查延長範圍內是否有同學跨機台衝突
+              const studentConflict = findStudentConflict(reservations, selectedStudents, userEmail, selectedStartMinutes, newDuration);
+              if (studentConflict) {
+                alert(`跨機台衝突！\n同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約，同時間不可重複預約！`);
                 return;
               }
               onSelectDuration(newDuration);
@@ -938,7 +1028,13 @@
         const adjustedMax = Math.floor(maxPossible / 10) * 10;
 
         if (hasReservationConflict(reservations, machineId, slotMinutes, minDuration)) {
-          alert(`時段衝突！從 ${minutesToTime(slotMinutes)} 開始的最少時長（${minDuration} 分鐘）已有預約，請換時段！`);
+          alert(`時段衝突！該機台從 ${minutesToTime(slotMinutes)} 開始的最少時長（${minDuration} 分鐘）已有預約，請換時段！`);
+          return;
+        }
+
+        const studentConflict = findStudentConflict(reservations, selectedStudents, userEmail, slotMinutes, minDuration);
+        if (studentConflict) {
+          alert(`跨機台時段衝突！\n名單中的同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約/排隊，同時間不可預約不同機台！`);
           return;
         }
 
@@ -958,6 +1054,7 @@
               <span className="text-emerald-600 font-bold">○ 可選</span>
               <span className="text-blue-600 font-bold">● 選定 ({selectedSlots}格)</span>
               <span className="text-slate-400 font-bold">■ 已占用</span>
+              <span className="text-amber-600 font-bold">▲ 跨機台衝突</span>
             </div>
           </div>
 
@@ -993,14 +1090,15 @@
                         let style = 'text-slate-200 bg-slate-50/40 cursor-not-allowed select-none';
                         if (info.status === 'selected') style = 'bg-blue-600 text-white font-bold cursor-pointer';
                         else if (info.status === 'occupied') style = 'text-slate-400 bg-slate-100/90 font-bold cursor-not-allowed';
+                        else if (info.status === 'student_busy') style = 'text-amber-600 bg-amber-50 font-bold cursor-pointer';
                         else if (info.status === 'available') style = 'text-emerald-600 hover:bg-emerald-50 cursor-pointer font-bold';
 
                         return (
                           <td
                             key={mStep}
                             className={`py-2 px-1 border-r border-slate-100 last:border-r-0 text-sm select-none ${style}`}
-                            onClick={() => (info.status === 'available' || info.status === 'selected') && handleCellClick(slotMin)}
-                            title={`${info.label} ${info.status === 'out_of_course' ? '(非課程時段)' : info.status === 'occupied' ? '(已占用)' : info.status === 'selected' ? '(點擊縮短至此格)' : '(可預約)'}`}
+                            onClick={() => (info.status === 'available' || info.status === 'selected' || info.status === 'student_busy') && handleCellClick(slotMin)}
+                            title={`${info.label} ${info.status === 'out_of_course' ? '(非課程時段)' : info.status === 'occupied' ? '(機台已占用)' : info.status === 'student_busy' ? `(同學在此時段已預約【${info.conflictMachine}】)` : info.status === 'selected' ? '(點擊縮短至此格)' : '(可預約)'}`}
                           >
                             {info.symbol}
                           </td>
@@ -1059,7 +1157,8 @@
         setSelectedDuration(maxDuration);
       };
 
-      const queueStartMin = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin);
+      // 現場排隊推算：傳入 selectedStudents 與 activeUser.mail，若同學在其他機台有排隊則自動往後順延
+      const queueStartMin = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin, selectedStudents, activeUser?.mail);
 
       const isSlotAllowed = phaseInfo.phase === 'SLOT_ONLY';
       const isQueueAllowed = phaseInfo.phase === 'QUEUE_ONLY' && systemSettings?.allow_walk_in_queue !== false;
@@ -1239,6 +1338,8 @@
                   maxDuration={maxDuration}
                   selectedStartSlot={selectedSlotId}
                   selectedDuration={selectedDuration}
+                  selectedStudents={selectedStudents}
+                  userEmail={activeUser?.mail}
                   onSelectSlot={handleSelectSlot}
                   onSelectDuration={setSelectedDuration}
                 />
