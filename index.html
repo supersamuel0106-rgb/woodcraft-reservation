@@ -503,6 +503,95 @@
         return () => clearInterval(timer);
       }, [refreshData]);
 
+      // NOTE: 推進機台隊列核心邏輯
+      // 規則：時段預約固定時間不變（不往前拉）；只有現場排隊者會在機台空閒時往前遞補
+      const advanceQueueForMachine = useCallback(async (machineId, reservationsSnapshot) => {
+        const sourceRes = reservationsSnapshot || reservations;
+        const now = new Date();
+        const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+        // 取得該機台尚未完成且未取消的所有預約
+        const activeResList = sourceRes.filter(r => 
+          r.machineId === machineId && 
+          (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
+        );
+
+        const queueList = activeResList
+          .filter(r => r.type === '現場排隊')
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        const slotList = activeResList
+          .filter(r => r.type === '時段預約')
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        if (queueList.length > 0) {
+          let runningStartMin = nowMinutes;
+
+          for (let i = 0; i < queueList.length; i++) {
+            const item = queueList[i];
+            const isFirst = i === 0;
+            const newStatus = isFirst ? '等候報到' : '排隊中';
+
+            let candStart = runningStartMin;
+            const dur = item.durationMinutes || 20;
+
+            // 若現場排隊時段與已固定的時段預約重疊，自動順延到該時段預約結束後
+            for (const slot of slotList) {
+              if (candStart < slot.endMinutes && candStart + dur > slot.startMinutes) {
+                candStart = Math.max(candStart, slot.endMinutes);
+              }
+            }
+
+            const updatePayload = {
+              status: newStatus,
+              start_minutes: candStart,
+              end_minutes: candStart + dur,
+              start_time_formatted: minutesToTime(candStart),
+              end_time_formatted: minutesToTime(candStart + dur)
+            };
+            if (isFirst) {
+              updatePayload.called_at = new Date().toISOString();
+            }
+
+            await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
+
+            // 第一位被叫號者發送通知
+            if (isFirst) {
+              sendQueueCallNotification({
+                studentNames: item.students.join(', '),
+                machineName: item.machineName,
+                startTime: minutesToTime(candStart),
+                endTime: minutesToTime(candStart + dur),
+                durationMinutes: dur,
+                toEmail: item.email || ''
+              });
+
+              const notif = {
+                id: `N_${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString('zh-TW'),
+                recipientName: item.students.join(', '),
+                machineName: item.machineName,
+                subject: '【叫號通知】輪到您使用機台了！',
+                body: `親愛的 ${item.students.join(', ')} 同學：您排隊的【${item.machineName}】已輪到您，時段為 ${minutesToTime(candStart)} ～ ${minutesToTime(candStart + dur)}，請於 5 分鐘內前往工廠報到！`
+              };
+              setNotifications(prev => [notif, ...prev]);
+            }
+
+            runningStartMin = candStart + dur;
+          }
+
+          await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
+        } else {
+          // 沒有現場排隊，檢查是否有即將開始的時段預約（5分鐘內）
+          const nextSlot = slotList[0];
+          if (nextSlot && Math.abs(nextSlot.startMinutes - nowMinutes) <= 5) {
+            await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
+          } else {
+            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          }
+        }
+      }, [reservations]);
+
       // NOTE: 自動過號與逾時取消掃描機制（每 8 秒自動輪詢）
       // 1. 現場排隊叫號 5 分鐘未報到 ➔ 自動跳過、叫下一位
       // 2. 時段預約開始後 5 分鐘未報到 ➔ 自動取消該時段，釋出給現場排隊遞補，但後面的時段預約保持固定不變
@@ -799,107 +888,6 @@
 
           await supabaseClient.from('machines').update({ status: '使用中' }).eq('id', realMacId);
           await refreshData();
-        }
-      };
-
-      const finishMachineUsage = async (machineId, reservationId) => {
-        // 1. 將指定的預約 (或當前使用中者) 設為已完成
-        let targetResId = reservationId;
-        if (!targetResId) {
-          const cur = reservations.find(r => r.machineId === machineId && r.status === '使用中');
-          targetResId = cur?.id;
-        }
-
-        if (targetResId) {
-          await supabaseClient.from('reservations').update({ status: '已完成', finished_at: new Date().toISOString() }).eq('id', targetResId);
-        }
-
-      // NOTE: 推進機台隊列核心邏輯
-      // 規則：時段預約固定時間不變（不往前拉）；只有現場排隊者會在機台空閒時往前遞補
-      const advanceQueueForMachine = async (machineId, reservationsSnapshot) => {
-        const sourceRes = reservationsSnapshot || reservations;
-        const now = new Date();
-        const nowMinutes = now.getHours() * 60 + now.getMinutes();
-
-        // 取得該機台尚未完成且未取消的所有預約
-        const activeResList = sourceRes.filter(r => 
-          r.machineId === machineId && 
-          (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
-        );
-
-        const queueList = activeResList
-          .filter(r => r.type === '現場排隊')
-          .sort((a, b) => a.startMinutes - b.startMinutes);
-
-        const slotList = activeResList
-          .filter(r => r.type === '時段預約')
-          .sort((a, b) => a.startMinutes - b.startMinutes);
-
-        if (queueList.length > 0) {
-          let runningStartMin = nowMinutes;
-
-          for (let i = 0; i < queueList.length; i++) {
-            const item = queueList[i];
-            const isFirst = i === 0;
-            const newStatus = isFirst ? '等候報到' : '排隊中';
-
-            let candStart = runningStartMin;
-            const dur = item.durationMinutes || 20;
-
-            // 若現場排隊時段與已固定的時段預約重疊，自動順延到該時段預約結束後
-            for (const slot of slotList) {
-              if (candStart < slot.endMinutes && candStart + dur > slot.startMinutes) {
-                candStart = Math.max(candStart, slot.endMinutes);
-              }
-            }
-
-            const updatePayload = {
-              status: newStatus,
-              start_minutes: candStart,
-              end_minutes: candStart + dur,
-              start_time_formatted: minutesToTime(candStart),
-              end_time_formatted: minutesToTime(candStart + dur)
-            };
-            if (isFirst) {
-              updatePayload.called_at = new Date().toISOString();
-            }
-
-            await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
-
-            // 第一位被叫號者發送通知
-            if (isFirst) {
-              sendQueueCallNotification({
-                studentNames: item.students.join(', '),
-                machineName: item.machineName,
-                startTime: minutesToTime(candStart),
-                endTime: minutesToTime(candStart + dur),
-                durationMinutes: dur,
-                toEmail: item.email || ''
-              });
-
-              const notif = {
-                id: `N_${Date.now()}`,
-                timestamp: new Date().toLocaleTimeString('zh-TW'),
-                recipientName: item.students.join(', '),
-                machineName: item.machineName,
-                subject: '【叫號通知】輪到您使用機台了！',
-                body: `親愛的 ${item.students.join(', ')} 同學：您排隊的【${item.machineName}】已輪到您，時段為 ${minutesToTime(candStart)} ～ ${minutesToTime(candStart + dur)}，請於 5 分鐘內前往工廠報到！`
-              };
-              setNotifications(prev => [notif, ...prev]);
-            }
-
-            runningStartMin = candStart + dur;
-          }
-
-          await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
-        } else {
-          // 沒有現場排隊，檢查是否有即將開始的時段預約（5分鐘內）
-          const nextSlot = slotList[0];
-          if (nextSlot && Math.abs(nextSlot.startMinutes - nowMinutes) <= 5) {
-            await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
-          } else {
-            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
-          }
         }
       };
 
