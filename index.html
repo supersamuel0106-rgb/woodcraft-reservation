@@ -446,7 +446,9 @@
             endTimeFormatted: row.end_time_formatted,
             status: row.status,
             email: row.email,
-            createdAt: row.created_at
+            createdAt: row.created_at,
+            calledAt: row.called_at,
+            notes: row.notes
           }));
           const rawStudents = (sRes.data || []).map(row => ({ id: row.id, name: row.name, studentNumber: row.student_number, mail: row.mail, role: row.role }));
           const rawSessions = (csRes.data || []).map(row => ({ id: row.id, sessionId: row.session_id, startTime: row.start_time, endTime: row.end_time, isCurrent: row.is_current, notes: row.notes }));
@@ -500,6 +502,88 @@
         const timer = setInterval(refreshData, 8000);
         return () => clearInterval(timer);
       }, [refreshData]);
+
+      // NOTE: 自動過號與逾時取消掃描機制（每 8 秒自動輪詢）
+      // 1. 現場排隊叫號 5 分鐘未報到 ➔ 自動跳過、叫下一位
+      // 2. 時段預約開始後 5 分鐘未報到 ➔ 自動取消該時段，釋出給現場排隊遞補，但後面的時段預約保持固定不變
+      useEffect(() => {
+        const scanTimeout = async () => {
+          if (!supabaseClient || isCoursePaused || reservations.length === 0) return;
+
+          const now = new Date();
+          const currentMin = now.getHours() * 60 + now.getMinutes();
+          const graceMin = systemSettings?.checkin_grace_minutes || 5;
+          const graceMs = graceMin * 60 * 1000;
+
+          let updatedAny = false;
+          const machinesToAdvance = new Set();
+
+          for (const r of reservations) {
+            // 規則 1: 現場排隊等候報到 逾時 5 分鐘未開始使用 -> 自動過號
+            if (r.type === '現場排隊' && r.status === '等候報到') {
+              if (r.calledAt) {
+                const calledTime = new Date(r.calledAt).getTime();
+                if (now.getTime() - calledTime >= graceMs) {
+                  console.log(`[Auto-Skip] 現場排隊叫號逾時未報到：${r.id} (${r.students.join(', ')})`);
+                  await supabaseClient.from('reservations').update({
+                    status: '未報到',
+                    cancelled_at: now.toISOString()
+                  }).eq('id', r.id);
+
+                  const notif = {
+                    id: `N_${Date.now()}`,
+                    timestamp: now.toLocaleTimeString('zh-TW'),
+                    recipientName: r.students.join(', '),
+                    machineName: r.machineName,
+                    subject: '【過號通知】排隊叫號逾時未報到',
+                    body: `親愛的 ${r.students.join(', ')} 同學：您排隊的【${r.machineName}】因超過 ${graceMin} 分鐘未報到，系統已自動跳過並叫號下一位同學。`
+                  };
+                  setNotifications(prev => [notif, ...prev]);
+
+                  machinesToAdvance.add(r.machineId);
+                  updatedAny = true;
+                }
+              }
+            }
+
+            // 規則 2: 時段預約開始後超過 5 分鐘未開始使用 -> 自動取消該時段
+            if (r.type === '時段預約' && (r.status === '排隊中' || r.status === '等候報到')) {
+              if (currentMin >= r.startMinutes + graceMin) {
+                console.log(`[Auto-Cancel] 時段預約逾時未報到：${r.id} (${r.students.join(', ')})`);
+                await supabaseClient.from('reservations').update({
+                  status: '未報到',
+                  cancelled_at: now.toISOString()
+                }).eq('id', r.id);
+
+                const notif = {
+                  id: `N_${Date.now()}`,
+                  timestamp: now.toLocaleTimeString('zh-TW'),
+                  recipientName: r.students.join(', '),
+                  machineName: r.machineName,
+                  subject: '【預約逾時取消】時段逾時未報到',
+                  body: `親愛的 ${r.students.join(', ')} 同學：您預約的【${r.machineName}】（時段 ${r.startTimeFormatted} ～ ${r.endTimeFormatted}）因超過開始時間 ${graceMin} 分鐘未報到，系統已自動取消該時段，釋出給現場排隊同學。`
+                };
+                setNotifications(prev => [notif, ...prev]);
+
+                machinesToAdvance.add(r.machineId);
+                updatedAny = true;
+              }
+            }
+          }
+
+          // 對有變動的機台推進現場排隊隊列
+          for (const macId of machinesToAdvance) {
+            await advanceQueueForMachine(macId);
+          }
+
+          if (updatedAny) {
+            await refreshData();
+          }
+        };
+
+        const timer = setInterval(scanTimeout, 8000);
+        return () => clearInterval(timer);
+      }, [reservations, isCoursePaused, systemSettings, refreshData]);
 
       // NOTE: 每 30 秒掃描一次，對距離開始 4~6 分鐘內的預約發送「時段前 5 分鐘提醒」通知
       // 僅通知目前登入者自己的預約，並用 localStorage 防止重複推播
@@ -730,36 +814,51 @@
           await supabaseClient.from('reservations').update({ status: '已完成', finished_at: new Date().toISOString() }).eq('id', targetResId);
         }
 
-        // 2. 取得當前時間分鐘基準
+      // NOTE: 推進機台隊列核心邏輯
+      // 規則：時段預約固定時間不變（不往前拉）；只有現場排隊者會在機台空閒時往前遞補
+      const advanceQueueForMachine = async (machineId, reservationsSnapshot) => {
+        const sourceRes = reservationsSnapshot || reservations;
         const now = new Date();
         const nowMinutes = now.getHours() * 60 + now.getMinutes();
 
-        // 3. 找出該機台剩餘所有排隊中的預約
-        const remainingQueue = reservations
-          .filter(r => 
-            r.machineId === machineId && 
-            r.id !== targetResId && 
-            (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
-          )
+        // 取得該機台尚未完成且未取消的所有預約
+        const activeResList = sourceRes.filter(r => 
+          r.machineId === machineId && 
+          (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
+        );
+
+        const queueList = activeResList
+          .filter(r => r.type === '現場排隊')
           .sort((a, b) => a.startMinutes - b.startMinutes);
 
-        if (remainingQueue.length > 0) {
+        const slotList = activeResList
+          .filter(r => r.type === '時段預約')
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        if (queueList.length > 0) {
           let runningStartMin = nowMinutes;
 
-          for (let i = 0; i < remainingQueue.length; i++) {
-            const item = remainingQueue[i];
-            const newStartMin = runningStartMin;
-            const newEndMin = newStartMin + item.durationMinutes;
+          for (let i = 0; i < queueList.length; i++) {
+            const item = queueList[i];
             const isFirst = i === 0;
             const newStatus = isFirst ? '等候報到' : '排隊中';
 
-            // 更新至 Supabase
+            let candStart = runningStartMin;
+            const dur = item.durationMinutes || 20;
+
+            // 若現場排隊時段與已固定的時段預約重疊，自動順延到該時段預約結束後
+            for (const slot of slotList) {
+              if (candStart < slot.endMinutes && candStart + dur > slot.startMinutes) {
+                candStart = Math.max(candStart, slot.endMinutes);
+              }
+            }
+
             const updatePayload = {
               status: newStatus,
-              start_minutes: newStartMin,
-              end_minutes: newEndMin,
-              start_time_formatted: minutesToTime(newStartMin),
-              end_time_formatted: minutesToTime(newEndMin)
+              start_minutes: candStart,
+              end_minutes: candStart + dur,
+              start_time_formatted: minutesToTime(candStart),
+              end_time_formatted: minutesToTime(candStart + dur)
             };
             if (isFirst) {
               updatePayload.called_at = new Date().toISOString();
@@ -767,39 +866,56 @@
 
             await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
 
-            // NOTE: 第一位被叫號者：同時發送瀏覽器推播通知 + EmailJS Email 通知
+            // 第一位被叫號者發送通知
             if (isFirst) {
               sendQueueCallNotification({
                 studentNames: item.students.join(', '),
                 machineName: item.machineName,
-                startTime: minutesToTime(newStartMin),
-                endTime: minutesToTime(newEndMin),
-                durationMinutes: item.durationMinutes,
+                startTime: minutesToTime(candStart),
+                endTime: minutesToTime(candStart + dur),
+                durationMinutes: dur,
                 toEmail: item.email || ''
               });
 
-              // 同時保留 in-app 通知物件（顯示在通知列表中）
               const notif = {
                 id: `N_${Date.now()}`,
                 timestamp: new Date().toLocaleTimeString('zh-TW'),
                 recipientName: item.students.join(', '),
                 machineName: item.machineName,
                 subject: '【叫號通知】輪到您使用機台了！',
-                body: `親愛的 ${item.students.join(', ')} 同學：您預約的【${item.machineName}】時段已更新為 ${minutesToTime(newStartMin)} ～ ${minutesToTime(newEndMin)}，請於 5 分鐘內前往工廠報到！`
+                body: `親愛的 ${item.students.join(', ')} 同學：您排隊的【${item.machineName}】已輪到您，時段為 ${minutesToTime(candStart)} ～ ${minutesToTime(candStart + dur)}，請於 5 分鐘內前往工廠報到！`
               };
               setNotifications(prev => [notif, ...prev]);
             }
 
-            runningStartMin = newEndMin;
+            runningStartMin = candStart + dur;
           }
 
-          // 4. 機台轉為 🟡 等待報到
           await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
         } else {
-          // 5. 無人排隊 ➔ 機台轉為 🟢 空閒
-          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          // 沒有現場排隊，檢查是否有即將開始的時段預約（5分鐘內）
+          const nextSlot = slotList[0];
+          if (nextSlot && Math.abs(nextSlot.startMinutes - nowMinutes) <= 5) {
+            await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
+          } else {
+            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          }
+        }
+      };
+
+      const finishMachineUsage = async (machineId, reservationId) => {
+        let targetResId = reservationId;
+        if (!targetResId) {
+          const cur = reservations.find(r => r.machineId === machineId && r.status === '使用中');
+          targetResId = cur?.id;
         }
 
+        if (targetResId) {
+          await supabaseClient.from('reservations').update({ status: '已完成', finished_at: new Date().toISOString() }).eq('id', targetResId);
+        }
+
+        // 推進現場排隊隊列 (不改動時段預約)
+        await advanceQueueForMachine(machineId, reservations.filter(r => r.id !== targetResId));
         await refreshData();
       };
 
@@ -808,12 +924,7 @@
         await supabaseClient.from('reservations').update({ status: '已取消', cancelled_at: new Date().toISOString() }).eq('id', resId);
         
         if (target) {
-          const remain = reservations
-            .filter(r => r.machineId === target.machineId && r.id !== resId && (r.status === '排隊中' || r.status === '等候報到'))
-            .sort((a, b) => a.startMinutes - b.startMinutes);
-          if (remain.length === 0) {
-            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', target.machineId);
-          }
+          await advanceQueueForMachine(target.machineId, reservations.filter(r => r.id !== resId));
         }
         await refreshData();
       };
