@@ -555,33 +555,55 @@
         if (!targetMac) return { success: false, message: '找不到機台' };
         if (data.students.length === 0) return { success: false, message: '請至少選一位學生' };
 
-        // 1. 取得目前登入者與選取學生名單中所有進行中的預約/排隊
-        const activeResList = reservations.filter(r => {
-          if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
-          const isSameEmail = activeUser?.mail && r.email && r.email.toLowerCase() === activeUser.mail.toLowerCase();
-          const hasCommonStudent = (r.students || []).some(s => data.students.includes(s));
-          return isSameEmail || hasCommonStudent;
-        });
+        // 1. 檢查小組預約名單中「每一位個別同學」的上限 (每人最多 3 筆時段預約、3 筆現場排隊)
+        for (const sName of data.students) {
+          const studentResList = reservations.filter(r => {
+            if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+            return (r.students || []).includes(sName);
+          });
 
-        // 2. 限制條件 3：最多只能有 3 筆「時段預約」
-        if (data.type === '時段預約') {
-          const activeSlotCount = activeResList.filter(r => r.type === '時段預約').length;
-          if (activeSlotCount >= 3) {
-            return {
-              success: false,
-              message: `已達預約上限：您（或名單中同學）目前已有 ${activeSlotCount} 筆進行中的「時段預約」，每人最多只能同時預約 3 筆！`
-            };
+          if (data.type === '時段預約') {
+            const slotCount = studentResList.filter(r => r.type === '時段預約').length;
+            if (slotCount >= 3) {
+              return {
+                success: false,
+                message: `同學「${sName}」目前已有 ${slotCount} 筆進行中的「時段預約」（已達每人 3 筆上限）！請先完成或取消既有預約後再加入。`
+              };
+            }
+          } else if (data.type === '現場排隊') {
+            const queueCount = studentResList.filter(r => r.type === '現場排隊').length;
+            if (queueCount >= 3) {
+              return {
+                success: false,
+                message: `同學「${sName}」目前已有 ${queueCount} 筆進行中的「現場排隊」（已達每人 3 筆上限）！請先完成或取消既有排隊後再加入。`
+              };
+            }
           }
         }
 
-        // 3. 限制條件 4：最多只能有 3 筆「現場排隊」
-        if (data.type === '現場排隊') {
-          const activeQueueCount = activeResList.filter(r => r.type === '現場排隊').length;
-          if (activeQueueCount >= 3) {
-            return {
-              success: false,
-              message: `已達排隊上限：您（或名單中同學）目前已有 ${activeQueueCount} 筆進行中的「現場排隊」，每人最多只能同時排隊 3 筆！`
-            };
+        // 2. 檢查目前登入帳號（預約發起人）本人的上限
+        if (activeUser?.mail) {
+          const emailResList = reservations.filter(r => {
+            if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+            return r.email && r.email.toLowerCase() === activeUser.mail.toLowerCase();
+          });
+
+          if (data.type === '時段預約') {
+            const emailSlotCount = emailResList.filter(r => r.type === '時段預約').length;
+            if (emailSlotCount >= 3) {
+              return {
+                success: false,
+                message: `您目前已建立了 ${emailSlotCount} 筆進行中的「時段預約」（已達每人 3 筆上限）！`
+              };
+            }
+          } else if (data.type === '現場排隊') {
+            const emailQueueCount = emailResList.filter(r => r.type === '現場排隊').length;
+            if (emailQueueCount >= 3) {
+              return {
+                success: false,
+                message: `您目前已建立了 ${emailQueueCount} 筆進行中的「現場排隊」（已達每人 3 筆上限）！`
+              };
+            }
           }
         }
 
