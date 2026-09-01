@@ -1012,11 +1012,10 @@
     }
 
     // ============================================================
-    // 7. 機台卡片 (MachineCard) - 1:1 截圖 1
     // ============================================================
-    function MachineCard({ machine, onOpenReservationModal }) {
-      const { startMachineUsage } = useApp();
-
+    // 7. 機台圖卡 (MachineCard) - 精簡版純圖卡，點擊進入詳情
+    // ============================================================
+    function MachineCard({ machine, onSelect }) {
       let bgClass = 'status-idle';
       let badge = '🟢 空閒';
       let hex = '#E8F5E9';
@@ -1032,57 +1031,180 @@
       }
 
       return (
-        <div className={`p-5 rounded-2xl shadow-xs border flex flex-col justify-between transition-all hover:shadow-md ${bgClass}`} style={{ backgroundColor: hex }}>
-          <div>
-            <div className="flex items-start justify-between mb-2">
-              <div>
-                <div className="w-9 h-9 rounded-full bg-black/5 flex items-center justify-center mb-2">
-                  <span className="text-base">🪚</span>
-                </div>
-                <h3 className="text-xl font-bold text-slate-900 leading-snug">{machine.name}</h3>
-                <p className="text-xs font-semibold text-slate-500 mt-0.5">空間</p>
+        <div
+          className={`p-5 rounded-2xl shadow-xs border flex flex-col justify-between transition-all hover:shadow-md active:scale-[0.98] cursor-pointer ${bgClass}`}
+          style={{ backgroundColor: hex }}
+          onClick={() => onSelect(machine)}
+        >
+          {/* 頂部圖示與狀態標籤 */}
+          <div className="flex items-start justify-between mb-3">
+            <div>
+              <div className="w-9 h-9 rounded-full bg-black/5 flex items-center justify-center mb-2">
+                <span className="text-base">🪚</span>
               </div>
-              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-white/80 border border-slate-200 shadow-2xs">
-                {badge}
+              <h3 className="text-xl font-bold text-slate-900 leading-snug">{machine.name}</h3>
+              <p className="text-xs font-semibold text-slate-500 mt-0.5">工廠機台</p>
+            </div>
+            <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-white/80 border border-slate-200 shadow-2xs">
+              {badge}
+            </span>
+          </div>
+
+          {/* 目前使用者與下一位 */}
+          <div className="pt-3 border-t border-black/5">
+            <p className="text-xs font-medium text-slate-600">
+              目前使用：<span className="font-bold text-slate-800">{machine.currentUserName || '—'}</span>
+              {' '}／{' '}
+              下一位：<span className="font-bold text-slate-800">{machine.nextUserName || '—'}</span>
+            </p>
+            <p className="text-[10px] text-slate-400 mt-1.5 flex items-center gap-1">
+              <span>點擊查看詳情與預約 →</span>
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 7b. 機台詳情頁 (MachineDetailView) - 顯示排隊清單 + 最快可用時段 + 新增預約
+    // ============================================================
+    function MachineDetailView({ machine, onBack, onOpenReservationModal }) {
+      const { reservations, systemSettings } = useApp();
+
+      // 取得此機台的有效排隊（排除已完成/已取消）
+      const machineReservations = reservations
+        .filter(r => r.machineId === machine.id && (r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中'))
+        .sort((a, b) => a.startMinutes - b.startMinutes);
+
+      // 計算最快可用時段（動態佇列算法）
+      const getNextAvailableTime = () => {
+        const now = new Date();
+        const currentMin = now.getHours() * 60 + now.getMinutes();
+        const roundedNow = Math.ceil(currentMin / 10) * 10;
+
+        if (machineReservations.length === 0) {
+          return `現在可立即使用（${minutesToTime(roundedNow)} 起）`;
+        }
+
+        const lastRes = machineReservations[machineReservations.length - 1];
+        const nextStart = Math.max(lastRes.endMinutes, roundedNow);
+        return `${minutesToTime(nextStart)} 開始`;
+      };
+
+      // 目前階段（判斷顯示哪種預約方式）
+      const phase = systemSettings ? getCurrentBookingPhase(systemSettings) : null;
+      const canBook = phase && phase.allowedType !== 'NONE';
+      const phaseLabel = phase
+        ? (phase.allowedType === '現場排隊' ? '🎟️ 現場排隊（上課時開放）' : phase.allowedType === '時段預約' ? '📅 時段預約（開課前 24 小時）' : '🔒 目前不開放預約')
+        : '讀取中...';
+
+      let hex = '#E8F5E9';
+      if (machine.status === '使用中') hex = '#FFEBEE';
+      else if (machine.status === '等待報到') hex = '#FFF8E1';
+
+      return (
+        <div className="space-y-3">
+          {/* 頂部返回列 */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onBack}
+              className="p-2 rounded-xl bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors shadow-xs"
+            >
+              ← 返回
+            </button>
+            <h3 className="font-bold text-slate-900 text-base">{machine.name}</h3>
+          </div>
+
+          {/* 機台基本狀態卡 */}
+          <div
+            className="p-4 rounded-2xl border shadow-xs"
+            style={{ backgroundColor: hex }}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-2xl">🪚</span>
+                <div>
+                  <h4 className="font-bold text-slate-900">{machine.name}</h4>
+                  <p className="text-xs text-slate-500">工廠機台</p>
+                </div>
+              </div>
+              <span className="text-xs font-bold px-3 py-1 rounded-full bg-white/80 border border-slate-200">
+                {machine.status === '使用中' ? '🔴 使用中' : machine.status === '等待報到' ? '🟡 等候報到' : '🟢 空閒'}
+              </span>
+            </div>
+          </div>
+
+          {/* 目前排隊清單 */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-100 flex items-center gap-2">
+              <span className="text-sm font-bold text-slate-800">📋 目前預約排隊清單</span>
+              <span className="text-[11px] bg-slate-100 text-slate-500 font-semibold px-2 py-0.5 rounded-full">
+                {machineReservations.length} 組
               </span>
             </div>
 
-            <div className="mt-3 mb-4 pt-3 border-t border-black/5">
-              <p className="text-sm font-medium text-slate-800">
-                目前使用：{machine.currentUserName || '—'} 下一位：{machine.nextUserName || '—'}
-              </p>
-            </div>
-          </div>
-
-          <div className="pt-3 border-t border-black/5 flex items-center gap-2">
-            {machine.status === '空閒' && (
-              <button
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm"
-                onClick={() => onOpenReservationModal(machine.id)}
-              >
-                + 新增預約 / 排隊
-              </button>
-            )}
-
-            {machine.status === '等待報到' && (
-              <div className="flex-1 py-2 px-3 text-xs font-bold text-amber-800 bg-amber-100/70 rounded-xl text-center border border-amber-200/80 select-none flex items-center justify-center gap-1.5">
-                <span>⏱️ 等候同學報到中</span>
+            {machineReservations.length === 0 ? (
+              <div className="px-4 py-6 text-center text-slate-400 text-sm">
+                <p className="text-2xl mb-2">✅</p>
+                <p className="font-semibold">目前無人排隊</p>
+                <p className="text-xs mt-1">可立即新增預約！</p>
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-50">
+                {machineReservations.map((res, index) => (
+                  <div key={res.id} className="px-4 py-3 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      {/* 順序號碼 */}
+                      <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${
+                        res.status === '使用中' ? 'bg-red-100 text-red-600' :
+                        res.status === '等候報到' ? 'bg-amber-100 text-amber-700' :
+                        'bg-slate-100 text-slate-600'
+                      }`}>
+                        {index + 1}
+                      </div>
+                      <div>
+                        <p className="text-sm font-bold text-slate-900">{res.students.join(', ')}</p>
+                        <p className="text-xs text-slate-500">{res.type}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-sm font-bold text-slate-800">{res.startTimeFormatted} ～ {res.endTimeFormatted}</p>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                        res.status === '使用中' ? 'bg-red-50 text-red-600' :
+                        res.status === '等候報到' ? 'bg-amber-50 text-amber-700' :
+                        'bg-blue-50 text-blue-600'
+                      }`}>
+                        {res.status}
+                      </span>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
-
-            {machine.status === '使用中' && (
-              <div className="flex-1 py-2 px-3 text-xs font-bold text-red-700/80 bg-red-100/60 rounded-xl text-center border border-red-200/60 select-none">
-                機台使用中
-              </div>
-            )}
-
-            <button
-              className="p-2.5 rounded-xl bg-white/70 hover:bg-white text-slate-600 border border-black/10 text-xs"
-              onClick={() => alert(`已複製機台【${machine.name}】狀態！`)}
-            >
-              🔗
-            </button>
           </div>
+
+          {/* 最快可用時段資訊 */}
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-4 py-3.5">
+            <p className="text-xs font-bold text-emerald-700 mb-1">⚡ 最快可使用時段</p>
+            <p className="text-base font-bold text-emerald-900">{getNextAvailableTime()}</p>
+            {phase && (
+              <p className="text-[11px] text-emerald-600 mt-1">{phaseLabel}</p>
+            )}
+          </div>
+
+          {/* 新增預約按鈕 */}
+          <button
+            onClick={() => onOpenReservationModal(machine.id)}
+            className={`w-full py-4 rounded-2xl font-bold text-sm shadow-md flex items-center justify-center gap-2 transition-all active:scale-[0.98] ${
+              canBook
+                ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-500/20'
+                : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+            }`}
+            disabled={!canBook}
+          >
+            <span>＋</span>
+            <span>新增預約 / 排隊</span>
+          </button>
         </div>
       );
     }
@@ -1454,15 +1576,44 @@
       const { machines, activeTab, setActiveTab, activeUser, isLoggedIn, logout, refreshData } = useApp();
       const [isResModalOpen, setIsResModalOpen] = useState(false);
       const [selectedMacId, setSelectedMacId] = useState(null);
+      // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
+      const [selectedMachine, setSelectedMachine] = useState(null);
 
       const openModal = (id) => {
         setSelectedMacId(id || null);
         setIsResModalOpen(true);
       };
 
+      // 點擊機台圖卡進入詳情
+      const handleSelectMachine = (machine) => {
+        setSelectedMachine(machine);
+      };
+
+      // 返回機台列表
+      const handleBackToList = () => {
+        setSelectedMachine(null);
+      };
+
+      // 切換 Tab 時同時清除機台詳情選取
+      const handleSetActiveTab = (tab) => {
+        setSelectedMachine(null);
+        setActiveTab(tab);
+      };
+
       if (!isLoggedIn) {
         return <LoginView />;
       }
+
+      // 目前頁面標題
+      const getTitle = () => {
+        if (activeTab === 'machines') {
+          return selectedMachine ? selectedMachine.name : '機台列表';
+        }
+        if (activeTab === 'reservations') return '我的預約';
+        if (activeTab === 'courses') return '課程場次';
+        if (activeTab === 'settings') return '預約設定';
+        return '';
+      };
 
       return (
         <div className="min-h-screen bg-slate-900 py-0 sm:py-6 flex flex-col items-center justify-center">
@@ -1473,7 +1624,7 @@
               <span>📶 ⚡ 100%</span>
             </div>
 
-            {/* 手機 App Header (1:1 截圖 1-4) */}
+            {/* 手機 App Header */}
             <div className="bg-white px-4 py-3 border-b border-slate-200 flex items-center justify-between shadow-2xs relative z-10">
               <div className="flex items-center gap-2.5">
                 <button onClick={logout} className="p-1.5 text-slate-500 hover:text-red-600 rounded-xl hover:bg-slate-100 text-sm transition-colors" title="登出並返回驗證介面">
@@ -1481,10 +1632,7 @@
                 </button>
                 <div>
                   <h2 className="font-bold text-base text-slate-900 leading-tight">
-                    {activeTab === 'machines' && '機台列表'}
-                    {activeTab === 'reservations' && '我的預約'}
-                    {activeTab === 'courses' && '課程場次'}
-                    {activeTab === 'settings' && '預約設定'}
+                    {getTitle()}
                   </h2>
                   <span className="text-[10px] text-slate-500 font-semibold block">
                     👤 {activeUser.name} ({activeUser.mail})
@@ -1494,27 +1642,42 @@
 
               <div className="flex items-center gap-2">
                 <button onClick={refreshData} className="p-1.5 text-slate-600 hover:text-slate-900 text-sm" title="重新整理">🔄</button>
-                <button onClick={() => openModal()} className="w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md font-bold text-base transition-transform active:scale-95">
-                  ＋
-                </button>
+                {/* NOTE: 詳情頁不顯示全域新增按鈕，改由詳情頁底部按鈕操作 */}
+                {!selectedMachine && (
+                  <button onClick={() => openModal()} className="w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md font-bold text-base transition-transform active:scale-95">
+                    ＋
+                  </button>
+                )}
               </div>
             </div>
 
             {/* 內容區 */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-100/70">
               {activeTab === 'machines' && (
-                <div className="space-y-3">
-                  {machines.map(m => (
-                    <MachineCard key={m.id} machine={m} onOpenReservationModal={openModal} />
-                  ))}
-                </div>
+                selectedMachine ? (
+                  // 機台詳情頁
+                  <MachineDetailView
+                    machine={selectedMachine}
+                    onBack={handleBackToList}
+                    onOpenReservationModal={(id) => {
+                      openModal(id);
+                    }}
+                  />
+                ) : (
+                  // 機台列表
+                  <div className="space-y-3">
+                    {machines.map(m => (
+                      <MachineCard key={m.id} machine={m} onSelect={handleSelectMachine} />
+                    ))}
+                  </div>
+                )
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
               {activeTab === 'courses' && <CourseSessionsView />}
               {activeTab === 'settings' && <BookingSettingsView />}
             </div>
 
-            {/* 底部導覽列 (1:1 截圖 1-4) */}
+            {/* 底部導覽列 */}
             <div className="h-16 bg-white border-t border-slate-200 flex items-center justify-around z-20 select-none shadow-lg">
               {[
                 { id: 'machines', label: '機台列表', icon: '🪚' },
@@ -1526,7 +1689,7 @@
                 return (
                   <button
                     key={t.id}
-                    onClick={() => setActiveTab(t.id)}
+                    onClick={() => handleSetActiveTab(t.id)}
                     className={`flex-1 h-full flex flex-col items-center justify-center gap-1 relative ${active ? 'text-blue-600 font-bold' : 'text-slate-500'}`}
                   >
                     <span className="text-lg">{t.icon}</span>
