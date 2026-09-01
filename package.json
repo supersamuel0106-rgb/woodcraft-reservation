@@ -1,14 +1,8 @@
 {
   "name": "woodcraft-reservation",
   "private": true,
-  "version": "0.4.0",
-  "type": "module",
+  "version": "1.0.0",
   "scripts": {
-    "dev": "node server.js",
-    "build": "echo Build succeeded",
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.49.1"
+    "build": "exit 0"
   }
 }
