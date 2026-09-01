@@ -652,33 +652,6 @@
               </button>
             </form>
 
-            {students.length > 0 && (
-              <div className="pt-4 border-t border-slate-100 space-y-2">
-                <div className="flex items-center gap-1.5 text-xs font-bold text-slate-600">
-                  <span>👤 修課名單快速填入測試：</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {students.map(s => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      onClick={() => {
-                        setEmailInput(s.mail);
-                        setErrMsg('');
-                      }}
-                      className={`text-[11px] font-semibold px-2.5 py-1 rounded-lg border transition-all ${
-                        emailInput === s.mail
-                          ? 'bg-blue-50 border-blue-300 text-blue-700 font-bold'
-                          : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
-                      }`}
-                    >
-                      {s.name} ({s.role === 'admin' ? '老師' : '同學'})
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
             <div className="text-center text-[11px] text-slate-400">
               系統將自動記錄登入狀態，下次開啟無需重複輸入。
             </div>

@@ -2,15 +2,15 @@
  * 登入與身份驗證視圖元件 (LoginView)
  * 
  * 驗證 Email 是否存在於「修課名單」Database 中
- * 支援 LocalStorage 記住登入狀態與快速測試選項
+ * 支援 LocalStorage 自動記住登入狀態
  */
 
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { LogIn, Wrench, AlertCircle, CheckCircle2, UserCheck } from 'lucide-react';
+import { LogIn, Wrench, AlertCircle } from 'lucide-react';
 
 export const LoginView: React.FC = () => {
-  const { students, loginWithEmail, isLoading } = useApp();
+  const { loginWithEmail, isLoading } = useApp();
   const [emailInput, setEmailInput] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -33,11 +33,6 @@ export const LoginView: React.FC = () => {
     } finally {
       setIsSubmitting(false);
     }
-  };
-
-  const handleQuickSelect = (mail: string) => {
-    setEmailInput(mail);
-    setErrorMessage('');
   };
 
   return (
@@ -92,32 +87,6 @@ export const LoginView: React.FC = () => {
             {isSubmitting ? '驗證修課名單中...' : '驗證身分並進入系統'}
           </button>
         </form>
-
-        {/* 快速選填提示 (從 Database 中的修課名單動態讀取) */}
-        {students.length > 0 && (
-          <div className="pt-4 border-t border-slate-100 space-y-2.5">
-            <div className="flex items-center gap-1.5 text-xs font-bold text-slate-600">
-              <UserCheck size={14} className="text-blue-600" />
-              <span>修課名單快速填入 (點擊可自動帶入測試)：</span>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {students.map(s => (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => handleQuickSelect(s.mail)}
-                  className={`text-[11px] font-semibold px-2.5 py-1 rounded-lg border transition-all ${
-                    emailInput === s.mail
-                      ? 'bg-blue-50 border-blue-300 text-blue-700 font-bold'
-                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
-                  }`}
-                >
-                  {s.name} ({s.role === 'admin' ? '老師' : '同學'})
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
 
         {/* 說明文字 */}
         <div className="text-center text-[11px] text-slate-400">
