@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>工廠機臺預約系統 v0.4 (Supabase 雲端獨立版)</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Supabase JS Client UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <!-- React 18 & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+
+  <!-- Babel Standalone -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: #0f172a;
+      color: #0f172a;
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* 機台狀態卡片自訂動態背景色 (Format Rules) */
+    .status-idle {
+      background-color: #E8F5E9 !important;
+      border: 1.5px solid #a5d6a7 !important;
+    }
+    .status-busy {
+      background-color: #FFEBEE !important;
+      border: 1.5px solid #ef9a9a !important;
+    }
+    .status-waiting {
+      background-color: #FFF8E1 !important;
+      border: 1.5px solid #ffe082 !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useMemo, createContext, useContext } = React;
+
+    // ============================================================
+    // 1. Supabase 連線設定
+    // ============================================================
+    const SUPABASE_URL = 'https://svksjbgkjnkonvntpbha.supabase.co';
+    const SUPABASE_ANON_KEY = 'sb_publishable_6AavmvJ1L-BFXXisShqFvA_ikn_mnSY';
+    const AUTH_STORAGE_KEY = 'factory_v04_logged_in_email';
+    const supabaseClient = window.supabase?.createClient ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+    // ============================================================
+    // 2. 核心計算公式 (Domain Rules)
+    // ============================================================
+    function calculateUsageMinutes(studentCount) {
+      if (studentCount <= 0) return 0;
+      return 20 + (studentCount - 1) * 10;
+    }
+
+    function timeToMinutes(timeStr) {
+      if (!timeStr) return 0;
+      const [hh, mm] = timeStr.split(':').map(Number);
+      return (hh || 0) * 60 + (mm || 0);
+    }
+
+    function minutesToTime(minutes) {
+      const hh = Math.floor(minutes / 60).toString().padStart(2, '0');
+      const mm = (minutes % 60).toString().padStart(2, '0');
+      return `${hh}:${mm}`;
+    }
+
+    function formatDateTime(d) {
+      if (!d) return '';
+      const date = new Date(d);
+      const yyyy = date.getFullYear();
+      const mm = (date.getMonth() + 1).toString().padStart(2, '0');
+      const dd = date.getDate().toString().padStart(2, '0');
+      const hh = date.getHours().toString().padStart(2, '0');
+      const min = date.getMinutes().toString().padStart(2, '0');
+      return `${yyyy}/${mm}/${dd} ${hh}:${min}`;
+    }
+
+    // 計算有效課程時間 (自動固定週三 09:00~12:00 vs 手動模式)
+    function getEffectiveCourseTimes(settings) {
+      const isAuto = !settings || settings.control_mode === '自動' || settings.controlMode === '自動';
+      const now = new Date();
+
+      if (isAuto) {
+        // 下一個週三 (day 3)
+        const currentDay = now.getDay();
+        let daysUntilWed = (3 - currentDay + 7) % 7;
+        if (daysUntilWed === 0) {
+          const todayNoon = new Date(now);
+          todayNoon.setHours(12, 0, 0, 0);
+          if (now >= todayNoon) daysUntilWed = 7;
+        }
+
+        const targetWed = new Date(now);
+        targetWed.setDate(now.getDate() + daysUntilWed);
+
+        const start = new Date(targetWed);
+        start.setHours(9, 0, 0, 0);
+
+        const end = new Date(targetWed);
+        end.setHours(12, 0, 0, 0);
+
+        const openTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+        return { startTime: start, endTime: end, openBookingTime: openTime, isAuto: true };
+      } else {
+        const startStr = settings.manual_course_start_time || settings.course_start_time || settings.courseStartTime || now.toISOString();
+        const endStr = settings.manual_course_end_time || settings.course_end_time || settings.courseEndTime || now.toISOString();
+        const start = new Date(startStr);
+        const end = new Date(endStr);
+        const openTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+        return { startTime: start, endTime: end, openBookingTime: openTime, isAuto: false };
+      }
+    }
+
+    // 判定預約階段
+    function getCurrentBookingPhase(settings) {
+      const { startTime, endTime, openBookingTime } = getEffectiveCourseTimes(settings);
+      const now = new Date();
+
+      if (now >= endTime) {
+        return {
+          phase: 'CLOSED',
+          title: '本次課程已結束',
+          description: `課程已於 ${formatDateTime(endTime)} 結束。`,
+          allowedType: 'NONE',
+          effectiveStart: startTime,
+          effectiveEnd: endTime
+        };
+      }
+
+      if (now >= startTime && now < endTime) {
+        return {
+          phase: 'QUEUE_ONLY',
+          title: '課程進行中（開放現場排隊）',
+          description: '課程已開始，目前僅開放「現場排隊」即時排號！',
+          allowedType: '現場排隊',
+          effectiveStart: startTime,
+          effectiveEnd: endTime
+        };
+      }
+
+      if (now >= openBookingTime && now < startTime) {
+        return {
+          phase: 'SLOT_ONLY',
+          title: '課程前 24 小時（開放時段預約）',
+          description: `距離開課 (${formatDateTime(startTime)}) 不足 24 小時，目前僅開放「時段預約」！`,
+          allowedType: '時段預約',
+          effectiveStart: startTime,
+          effectiveEnd: endTime
+        };
+      }
+
+      return {
+        phase: 'NOT_OPEN',
+        title: '預約尚未開放',
+        description: `將於開課前 24 小時（${formatDateTime(openBookingTime)}）正式開放時段預約。`,
+        allowedType: 'NONE',
+        effectiveStart: startTime,
+        effectiveEnd: endTime
+      };
+    }
+
+    function hasReservationConflict(reservations, machineId, startMin, durationMin, ignoreId) {
+      const endMin = startMin + durationMin;
+      return reservations.some(r => {
+        if (r.machineId !== machineId) return false;
+        if (r.id === ignoreId) return false;
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        return r.startMinutes < endMin && r.endMinutes > startMin;
+      });
+    }
+
+    function calculateDynamicQueueStart(reservations, machineId, durationMin = 20) {
+      const now = new Date();
+      const currentMin = now.getHours() * 60 + now.getMinutes();
+      const roundedNow = Math.ceil(currentMin / 10) * 10;
+
+      const activeRes = reservations.filter(r => 
+        r.machineId === machineId && 
+        (r.status === '排隊中' || r.status === '等待中' || r.status === '等候報到' || r.status === '使用中')
+      );
+
+      let baseline = roundedNow;
+      if (activeRes.length > 0) {
+        const maxEnd = Math.max(...activeRes.map(r => r.endMinutes));
+        baseline = Math.max(roundedNow, maxEnd);
+      }
+
+      let cand = baseline;
+      while (cand + durationMin <= 1020) {
+        if (!hasReservationConflict(reservations, machineId, cand, durationMin)) {
+          return cand;
+        }
+        cand += 10;
+      }
+      return baseline;
+    }
+
+    function getNextQueueWaiter(reservations, machineId) {
+      return reservations
+        .filter(r => r.machineId === machineId && (r.status === '排隊中' || r.status === '等待中'))
+        .sort((a, b) => a.startMinutes - b.startMinutes)[0];
+    }
+
+    // ============================================================
+    // 3. AppContext 狀態管理
+    // ============================================================
+    const AppContext = createContext(null);
+
+    function AppProvider({ children }) {
+      const [machines, setMachines] = useState([]);
+      const [reservations, setReservations] = useState([]);
+      const [students, setStudents] = useState([]);
+      const [courseSessions, setCourseSessions] = useState([]);
+      const [systemSettings, setSystemSettings] = useState(null);
+      const [notifications, setNotifications] = useState([]);
+      const [activeUser, setActiveUser] = useState({ name: '李信恩', mail: 'supersamuel0106@gmail.com', role: 'admin' });
+      const [isLoggedIn, setIsLoggedIn] = useState(false);
+      const [viewMode, setViewMode] = useState('mobile');
+      const [activeTab, setActiveTab] = useState('machines');
+      const [isLiveSupabase, setIsLiveSupabase] = useState(true);
+      const [isLoading, setIsLoading] = useState(true);
+
+      const refreshData = useCallback(async () => {
+        if (!supabaseClient) return;
+        try {
+          const [mRes, rRes, sRes, csRes, settRes] = await Promise.all([
+            supabaseClient.from('machines').select('*').order('id'),
+            supabaseClient.from('reservations').select('*').order('created_at', { ascending: false }),
+            supabaseClient.from('students').select('*').order('name'),
+            supabaseClient.from('course_sessions').select('*').order('session_id'),
+            supabaseClient.from('system_settings').select('*').eq('id', 'DEFAULT').single()
+          ]);
+
+          const rawMachines = (mRes.data || []).map(row => ({ id: row.id, name: row.name, status: row.status }));
+          const rawReservations = (rRes.data || []).map(row => ({
+            id: row.id,
+            machineId: row.machine_id,
+            machineName: row.machine_name,
+            type: row.type,
+            students: row.students || [],
+            studentCount: row.student_count,
+            durationMinutes: row.duration_minutes,
+            timeSlotId: row.time_slot_id,
+            startMinutes: row.start_minutes,
+            endMinutes: row.end_minutes,
+            startTimeFormatted: row.start_time_formatted,
+            endTimeFormatted: row.end_time_formatted,
+            status: row.status,
+            email: row.email,
+            createdAt: row.created_at
+          }));
+          const rawStudents = (sRes.data || []).map(row => ({ id: row.id, name: row.name, studentNumber: row.student_number, mail: row.mail, role: row.role }));
+          const rawSessions = (csRes.data || []).map(row => ({ id: row.id, sessionId: row.session_id, startTime: row.start_time, endTime: row.end_time, isCurrent: row.is_current, notes: row.notes }));
+
+          const updatedMachines = rawMachines.map(mac => {
+            const inUse = rawReservations.find(r => r.machineId === mac.id && r.status === '使用中');
+            const waitCheckin = rawReservations.find(r => r.machineId === mac.id && r.status === '等候報到');
+            const nextW = getNextQueueWaiter(rawReservations, mac.id);
+
+            let computed = '空閒';
+            if (inUse) computed = '使用中';
+            else if (waitCheckin) computed = '等待報到';
+
+            return {
+              ...mac,
+              status: computed,
+              currentUserName: inUse ? inUse.students.join(', ') : undefined,
+              nextUserName: waitCheckin 
+                ? waitCheckin.students.join(', ') 
+                : nextW 
+                ? nextW.students.join(', ') 
+                : undefined
+            };
+          });
+
+          setMachines(updatedMachines);
+          setReservations(rawReservations);
+          setStudents(rawStudents);
+          setCourseSessions(rawSessions);
+          setSystemSettings(settRes.data || null);
+          setIsLiveSupabase(true);
+
+          const savedEmail = localStorage.getItem(AUTH_STORAGE_KEY);
+          if (savedEmail && rawStudents.length > 0) {
+            const matched = rawStudents.find(s => s.mail.toLowerCase() === savedEmail.trim().toLowerCase());
+            if (matched) {
+              setActiveUser(matched);
+              setIsLoggedIn(true);
+            }
+          }
+        } catch (e) {
+          console.warn('Supabase fetch failed:', e);
+          setIsLiveSupabase(false);
+        } finally {
+          setIsLoading(false);
+        }
+      }, []);
+
+      useEffect(() => {
+        refreshData();
+        const timer = setInterval(refreshData, 8000);
+        return () => clearInterval(timer);
+      }, [refreshData]);
+
+      const loginWithEmail = async (email) => {
+        const trimmed = email.trim().toLowerCase();
+        const matched = students.find(s => s.mail.toLowerCase() === trimmed);
+
+        if (!matched) {
+          return {
+            success: false,
+            message: `驗證失敗：【${email}】未出現在修課名單中！請確認輸入無誤，或向老師/助教確認。`
+          };
+        }
+
+        setActiveUser(matched);
+        setIsLoggedIn(true);
+        localStorage.setItem(AUTH_STORAGE_KEY, matched.mail);
+        return {
+          success: true,
+          message: `歡迎回來，${matched.name} ${matched.role === 'admin' ? '老師' : '同學'}！`
+        };
+      };
+
+      const logout = () => {
+        localStorage.removeItem(AUTH_STORAGE_KEY);
+        setIsLoggedIn(false);
+      };
+
+      const createReservation = async (data) => {
+        const targetMac = machines.find(m => m.id === data.machineId);
+        if (!targetMac) return { success: false, message: '找不到機台' };
+        if (data.students.length === 0) return { success: false, message: '請至少選一位學生' };
+
+        const duration = calculateUsageMinutes(data.students.length);
+        let startMin = 540;
+        let slotId = data.timeSlotId;
+
+        if (data.type === '時段預約') {
+          if (!slotId) return { success: false, message: '請於時段矩陣選擇起始時段' };
+          startMin = timeToMinutes(slotId);
+          if (hasReservationConflict(reservations, data.machineId, startMin, duration)) {
+            return { success: false, message: `時段 ${slotId} 已被占用！` };
+          }
+        } else {
+          startMin = calculateDynamicQueueStart(reservations, data.machineId, duration);
+          slotId = null; // 現場排隊不綁定 time_slots 外鍵
+        }
+
+        const endMin = startMin + duration;
+
+        const payload = {
+          machine_id: data.machineId,
+          machine_name: targetMac.name,
+          type: data.type,
+          students: data.students,
+          student_count: data.students.length,
+          duration_minutes: duration,
+          time_slot_id: slotId,
+          start_minutes: startMin,
+          end_minutes: endMin,
+          start_time_formatted: minutesToTime(startMin),
+          end_time_formatted: minutesToTime(endMin),
+          status: '排隊中',
+          email: activeUser.mail
+        };
+
+        const { error } = await supabaseClient.from('reservations').insert(payload);
+        if (error) {
+          console.error('Supabase error:', error);
+          return { success: false, message: `資料庫儲存失敗：${error.message}` };
+        }
+
+        await refreshData();
+        return {
+          success: true,
+          message: `成功建立【${data.type}】！預約時段：${minutesToTime(startMin)} ～ ${minutesToTime(endMin)}`
+        };
+      };
+
+      const startMachineUsage = async (machineId, reservationId) => {
+        let targetRes;
+        if (reservationId) {
+          targetRes = reservations.find(r => r.id === reservationId);
+        } else {
+          targetRes = reservations.find(r => 
+            r.machineId === machineId && 
+            (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
+          );
+        }
+
+        if (targetRes) {
+          const realMacId = targetRes.machineId || machineId;
+          const now = new Date();
+          const nowMinutes = now.getHours() * 60 + now.getMinutes();
+          const newEndMinutes = nowMinutes + targetRes.durationMinutes;
+
+          await supabaseClient.from('reservations').update({
+            status: '使用中',
+            start_minutes: nowMinutes,
+            end_minutes: newEndMinutes,
+            start_time_formatted: minutesToTime(nowMinutes),
+            end_time_formatted: minutesToTime(newEndMinutes),
+            started_at: new Date().toISOString()
+          }).eq('id', targetRes.id);
+
+          await supabaseClient.from('machines').update({ status: '使用中' }).eq('id', realMacId);
+          await refreshData();
+        }
+      };
+
+      const finishMachineUsage = async (machineId, reservationId) => {
+        // 1. 將指定的預約 (或當前使用中者) 設為已完成
+        let targetResId = reservationId;
+        if (!targetResId) {
+          const cur = reservations.find(r => r.machineId === machineId && r.status === '使用中');
+          targetResId = cur?.id;
+        }
+
+        if (targetResId) {
+          await supabaseClient.from('reservations').update({ status: '已完成', finished_at: new Date().toISOString() }).eq('id', targetResId);
+        }
+
+        // 2. 取得當前時間分鐘基準
+        const now = new Date();
+        const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+        // 3. 找出該機台剩餘所有排隊中的預約
+        const remainingQueue = reservations
+          .filter(r => 
+            r.machineId === machineId && 
+            r.id !== targetResId && 
+            (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
+          )
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        if (remainingQueue.length > 0) {
+          let runningStartMin = nowMinutes;
+
+          for (let i = 0; i < remainingQueue.length; i++) {
+            const item = remainingQueue[i];
+            const newStartMin = runningStartMin;
+            const newEndMin = newStartMin + item.durationMinutes;
+            const isFirst = i === 0;
+            const newStatus = isFirst ? '等候報到' : '排隊中';
+
+            // 更新至 Supabase
+            const updatePayload = {
+              status: newStatus,
+              start_minutes: newStartMin,
+              end_minutes: newEndMin,
+              start_time_formatted: minutesToTime(newStartMin),
+              end_time_formatted: minutesToTime(newEndMin)
+            };
+            if (isFirst) {
+              updatePayload.called_at = new Date().toISOString();
+            }
+
+            await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
+
+            // 第一位推播叫號通知
+            if (isFirst) {
+              const notif = {
+                id: `N_${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString('zh-TW'),
+                recipientName: item.students.join(', '),
+                machineName: item.machineName,
+                subject: '【叫號通知】輪到您使用機台了！',
+                body: `親愛的 ${item.students.join(', ')} 同學：您預約的【${item.machineName}】目前已提早空出，時段已更新為 ${minutesToTime(newStartMin)} ～ ${minutesToTime(newEndMin)}，請於 5 分鐘內前往工廠報到使用！`
+              };
+              setNotifications(prev => [notif, ...prev]);
+            }
+
+            runningStartMin = newEndMin;
+          }
+
+          // 4. 機台轉為 🟡 等待報到
+          await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
+        } else {
+          // 5. 無人排隊 ➔ 機台轉為 🟢 空閒
+          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+        }
+
+        await refreshData();
+      };
+
+      const cancelReservation = async (resId) => {
+        const target = reservations.find(r => r.id === resId);
+        await supabaseClient.from('reservations').update({ status: '已取消', cancelled_at: new Date().toISOString() }).eq('id', resId);
+        
+        if (target) {
+          const remain = reservations
+            .filter(r => r.machineId === target.machineId && r.id !== resId && (r.status === '排隊中' || r.status === '等候報到'))
+            .sort((a, b) => a.startMinutes - b.startMinutes);
+          if (remain.length === 0) {
+            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', target.machineId);
+          }
+        }
+        await refreshData();
+      };
+
+      const clearCompletedReservations = async () => {
+        const { data, error } = await supabaseClient
+          .from('reservations')
+          .delete()
+          .eq('email', activeUser.mail)
+          .in('status', ['已完成', '已取消'])
+          .select();
+
+        if (error) {
+          console.error('Clear completed error:', error);
+          return { success: false, message: `清除失敗：${error.message}`, count: 0 };
+        }
+        await refreshData();
+        return {
+          success: true,
+          message: `已成功從資料庫清除 ${data ? data.length : 0} 筆已完成預約紀錄！`,
+          count: data ? data.length : 0
+        };
+      };
+
+      const setCurrentCourseSession = async (sessId) => {
+        await supabaseClient.from('course_sessions').update({ is_current: false }).neq('id', '00000000-0000-0000-0000-000000000000');
+        await supabaseClient.from('course_sessions').update({ is_current: true }).eq('id', sessId);
+        await refreshData();
+      };
+
+      const updateSettings = async (sett) => {
+        await supabaseClient.from('system_settings').update(sett).eq('id', 'DEFAULT');
+        await refreshData();
+      };
+
+      return (
+        <AppContext.Provider value={{
+          machines,
+          reservations,
+          students,
+          courseSessions,
+          systemSettings,
+          notifications,
+          activeUser,
+          isLoggedIn,
+          activeTab,
+          isLiveSupabase,
+          isLoading,
+          setActiveTab,
+          setActiveUser,
+          loginWithEmail,
+          logout,
+          createReservation,
+          startMachineUsage,
+          finishMachineUsage,
+          cancelReservation,
+          clearCompletedReservations,
+          setCurrentCourseSession,
+          updateSettings,
+          refreshData
+        }}>
+          {children}
+        </AppContext.Provider>
+      );
+    }
+
+    const useApp = () => useContext(AppContext);
+
+    // ============================================================
+    // 4. 登入介面元件 (LoginView)
+    // ============================================================
+    function LoginView() {
+      const { students, loginWithEmail, isLoading } = useApp();
+      const [emailInput, setEmailInput] = useState('');
+      const [errMsg, setErrMsg] = useState('');
+      const [submitting, setSubmitting] = useState(false);
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        setErrMsg('');
+        if (!emailInput.trim()) return setErrMsg('請輸入您的 Email！');
+
+        setSubmitting(true);
+        try {
+          const res = await loginWithEmail(emailInput.trim());
+          if (!res.success) {
+            setErrMsg(res.message);
+          }
+        } finally {
+          setSubmitting(false);
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-900 flex flex-col justify-center items-center p-4">
+          <div className="max-w-md w-full bg-white rounded-3xl shadow-2xl p-8 border border-slate-200 space-y-6">
+            <div className="text-center space-y-2">
+              <div className="w-16 h-16 bg-blue-600 rounded-2xl mx-auto flex items-center justify-center shadow-lg shadow-blue-500/30 text-white text-3xl mb-3">
+                🪚
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900">工廠機台預約系統</h2>
+              <p className="text-xs font-semibold text-slate-500">
+                請輸入修課名單登記之 Email 進行身份驗證
+              </p>
+            </div>
+
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">電子郵件 (Email)：</label>
+                <input
+                  type="email"
+                  value={emailInput}
+                  onChange={e => {
+                    setEmailInput(e.target.value);
+                    if (errMsg) setErrMsg('');
+                  }}
+                  placeholder="example@gmail.com"
+                  disabled={isLoading || submitting}
+                  className="w-full border-2 border-slate-300 focus:border-blue-600 rounded-xl p-3 text-sm font-semibold text-slate-900 bg-white focus:outline-none transition-colors"
+                />
+              </div>
+
+              {errMsg && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 font-medium flex items-start gap-2">
+                  <span>⚠️</span>
+                  <span>{errMsg}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isLoading || submitting}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl shadow-md shadow-blue-500/20 text-sm transition-all"
+              >
+                {submitting ? '驗證名單中...' : '驗證身分並進入系統'}
+              </button>
+            </form>
+
+            {students.length > 0 && (
+              <div className="pt-4 border-t border-slate-100 space-y-2">
+                <div className="flex items-center gap-1.5 text-xs font-bold text-slate-600">
+                  <span>👤 修課名單快速填入測試：</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {students.map(s => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => {
+                        setEmailInput(s.mail);
+                        setErrMsg('');
+                      }}
+                      className={`text-[11px] font-semibold px-2.5 py-1 rounded-lg border transition-all ${
+                        emailInput === s.mail
+                          ? 'bg-blue-50 border-blue-300 text-blue-700 font-bold'
+                          : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      {s.name} ({s.role === 'admin' ? '老師' : '同學'})
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="text-center text-[11px] text-slate-400">
+              系統將自動記錄登入狀態，下次開啟無需重複輸入。
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 5. 時段矩陣元件 (TimeTableMatrix) - 動態依照課程時段生成
+    // ============================================================
+    const MINUTES_STEP = [0, 10, 20, 30, 40, 50];
+
+    function TimeTableMatrix({ machineId, durationMinutes, selectedStartSlot, onSelectSlot }) {
+      const { reservations, systemSettings } = useApp();
+      const effectiveTimes = getEffectiveCourseTimes(systemSettings);
+      const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
+      const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
+
+      const startHour = Math.floor(courseStartMin / 60);
+      const endHour = Math.floor((Math.max(courseEndMin, courseStartMin + 10) - 1) / 60);
+
+      const hoursList = [];
+      for (let h = startHour; h <= endHour; h++) {
+        hoursList.push(h);
+      }
+
+      const selectedStartMinutes = selectedStartSlot ? timeToMinutes(selectedStartSlot) : null;
+
+      const getSlotState = (slotMinutes) => {
+        const timeLabel = minutesToTime(slotMinutes);
+
+        // 超出課程時間
+        if (slotMinutes < courseStartMin || slotMinutes >= courseEndMin) {
+          return { status: 'out_of_course', symbol: '·', label: timeLabel };
+        }
+
+        if (
+          selectedStartMinutes !== null &&
+          slotMinutes >= selectedStartMinutes &&
+          slotMinutes < selectedStartMinutes + durationMinutes
+        ) {
+          return { status: 'selected', symbol: '●', label: timeLabel };
+        }
+
+        const isOccupied = reservations.some(r => {
+          if (r.machineId !== machineId) return false;
+          if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+          return slotMinutes >= r.startMinutes && slotMinutes < r.endMinutes;
+        });
+
+        if (isOccupied) {
+          return { status: 'occupied', symbol: '■', label: timeLabel };
+        }
+        return { status: 'available', symbol: '○', label: timeLabel };
+      };
+
+      const handleCellClick = (slotMinutes) => {
+        if (slotMinutes < courseStartMin || slotMinutes >= courseEndMin) return;
+
+        if (slotMinutes + durationMinutes > courseEndMin) {
+          alert(`無法預約！\n預約時長 ${durationMinutes} 分鐘將會超過本次課程結束時間 (${minutesToTime(courseEndMin)})！\n請選擇較早的時段。`);
+          return;
+        }
+
+        if (hasReservationConflict(reservations, machineId, slotMinutes, durationMinutes)) {
+          alert(`時段衝突！\n從 ${minutesToTime(slotMinutes)} 開始的 ${durationMinutes} 分鐘已有預約，請換時段！`);
+          return;
+        }
+        onSelectSlot(minutesToTime(slotMinutes));
+      };
+
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+            <span>課程時段矩陣 ({minutesToTime(courseStartMin)} ～ {minutesToTime(courseEndMin)})：</span>
+            <div className="flex items-center gap-3 text-[11px]">
+              <span className="text-emerald-600 font-bold">○ 可選</span>
+              <span className="text-blue-600 font-bold">● 選定 ({Math.ceil(durationMinutes/10)}格)</span>
+              <span className="text-slate-400 font-bold">■ 已占用</span>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-2xs">
+            <table className="w-full text-center border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
+                  <th className="py-2 px-2 border-r border-slate-200 w-16">小時</th>
+                  {MINUTES_STEP.map(m => (
+                    <th key={m} className="py-2 px-1 border-r border-slate-100 last:border-r-0">
+                      :{m.toString().padStart(2, '0')}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {hoursList.map(hNum => {
+                  const hStr = hNum.toString().padStart(2, '0');
+                  return (
+                    <tr key={hNum} className="border-b border-slate-100 hover:bg-slate-50/50">
+                      <td className="py-2 px-2 font-bold text-slate-700 bg-slate-50/80 border-r border-slate-200 text-xs">
+                        {hStr}:00
+                      </td>
+                      {MINUTES_STEP.map(mStep => {
+                        const slotMin = hNum * 60 + mStep;
+                        const info = getSlotState(slotMin);
+                        let style = 'text-slate-200 bg-slate-50/40 cursor-not-allowed select-none';
+                        if (info.status === 'selected') style = 'bg-blue-600 text-white font-bold cursor-pointer';
+                        else if (info.status === 'occupied') style = 'text-slate-400 bg-slate-100/90 font-bold cursor-not-allowed';
+                        else if (info.status === 'available') style = 'text-emerald-600 hover:bg-emerald-50 cursor-pointer font-bold';
+
+                        return (
+                          <td
+                            key={mStep}
+                            className={`py-2 px-1 border-r border-slate-100 last:border-r-0 text-sm select-none ${style}`}
+                            onClick={() => info.status === 'available' && handleCellClick(slotMin)}
+                            title={`${info.label} ${info.status === 'out_of_course' ? '(非課程時段)' : info.status === 'occupied' ? '(已占用)' : '(可預約)'}`}
+                          >
+                            {info.symbol}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {selectedStartSlot && (
+            <div className="bg-blue-50 border border-blue-200 text-blue-900 px-3 py-2 rounded-xl text-xs flex items-center justify-between font-medium">
+              <span>已選：<strong>{selectedStartSlot}</strong> ～ <strong>{minutesToTime(timeToMinutes(selectedStartSlot) + durationMinutes)}</strong></span>
+              <span className="bg-blue-600 text-white px-2 py-0.5 rounded-full text-[10px] font-bold">共 {durationMinutes} 分鐘</span>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 6. 新增預約 / 現場排隊 Modal (連動 24h 前時段預約與開課現場排隊限制)
+    // ============================================================
+    function ReservationModal({ initialMachineId, onClose }) {
+      const { machines, students, activeUser, reservations, systemSettings, createReservation } = useApp();
+      const effectiveTimes = getEffectiveCourseTimes(systemSettings);
+      const phaseInfo = getCurrentBookingPhase(systemSettings);
+
+      const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
+      const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
+
+      const [selectedMachineId, setSelectedMachineId] = useState(initialMachineId || machines[0]?.id || '帶鋸機');
+      const [reservationType, setReservationType] = useState(
+        phaseInfo.allowedType === '現場排隊' ? '現場排隊' : '時段預約'
+      );
+      const [selectedStudents, setSelectedStudents] = useState([activeUser.name]);
+      const [selectedSlotId, setSelectedSlotId] = useState(minutesToTime(courseStartMin));
+      const [isSubmitting, setIsSubmitting] = useState(false);
+
+      const durationMinutes = calculateUsageMinutes(selectedStudents.length);
+      const queueStartMin = calculateDynamicQueueStart(reservations, selectedMachineId, durationMinutes, courseEndMin);
+
+      const isSlotAllowed = phaseInfo.phase === 'SLOT_ONLY';
+      const isQueueAllowed = phaseInfo.phase === 'QUEUE_ONLY' && systemSettings?.allow_walk_in_queue !== false;
+
+      useEffect(() => {
+        if (phaseInfo.phase === 'QUEUE_ONLY') setReservationType('現場排隊');
+        else if (phaseInfo.phase === 'SLOT_ONLY') setReservationType('時段預約');
+      }, [phaseInfo.phase]);
+
+      const toggleStudent = (sName) => {
+        if (selectedStudents.includes(sName)) {
+          if (selectedStudents.length === 1) return alert('預約必須至少選一位學生');
+          setSelectedStudents(prev => prev.filter(s => s !== sName));
+        } else {
+          setSelectedStudents(prev => [...prev, sName]);
+        }
+      };
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!selectedMachineId) return alert('請選擇預約機台！');
+        if (selectedStudents.length === 0) return alert('請至少選擇一位學生！');
+
+        // 業務防呆驗證 (友善繁體中文提示)
+        if (reservationType === '現場排隊') {
+          if (phaseInfo.phase !== 'QUEUE_ONLY') {
+            alert(`⚠️ 現在是非上課時段，不能進行現場排隊預約！\n\n• 現場排隊開放時段：課程進行中 (${formatDateTime(effectiveTimes.startTime)} ～ ${formatDateTime(effectiveTimes.endTime)})\n• 如需預約下堂課，請於開課前 24 小時使用「時段預約」。`);
+            return;
+          }
+          if (systemSettings?.allow_walk_in_queue === false) {
+            alert('⚠️ 目前系統已關閉現場排隊功能，請洽授課老師/助教！');
+            return;
+          }
+        }
+
+        if (reservationType === '時段預約') {
+          if (phaseInfo.phase !== 'SLOT_ONLY') {
+            if (phaseInfo.phase === 'QUEUE_ONLY') {
+              alert('⚠️ 課程已開始進行中，目前僅開放「現場排隊」，時段預約已截止！');
+            } else if (phaseInfo.phase === 'NOT_OPEN') {
+              alert(`⚠️ 現在非時段預約開放時間！\n\n系統將於課程開始前 24 小時（${formatDateTime(effectiveTimes.openBookingTime)}）正式開放時段預約。`);
+            } else {
+              alert('⚠️ 本次課程已經結束，不再接受預約！');
+            }
+            return;
+          }
+
+          if (!selectedSlotId) return alert('請於時段矩陣中點選開始預約之時段！');
+        }
+
+        setIsSubmitting(true);
+        try {
+          const res = await createReservation({
+            machineId: selectedMachineId,
+            type: reservationType,
+            students: selectedStudents,
+            timeSlotId: selectedSlotId
+          });
+          if (!res.success) {
+            alert(`❌ 預約失敗：${res.message}`);
+          } else {
+            alert(`✅ ${res.message}`);
+            onClose();
+          }
+        } catch (err) {
+          alert(`❌ 系統提示：${err.message || '預約處理發生錯誤'}`);
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl max-w-xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh] border border-slate-200">
+            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/80">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <span>🛠️</span> 新增機台預約 / 現場排隊
+                </h3>
+                <p className="text-[11px] text-slate-500 font-semibold mt-0.5">
+                  課程時間：{formatDateTime(effectiveTimes.startTime)} ～ {formatDateTime(effectiveTimes.endTime)}
+                </p>
+              </div>
+              <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1">✕</button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-6 overflow-y-auto space-y-4">
+              {/* 開放狀態提示 Banner */}
+              <div className={`p-3.5 rounded-2xl border text-xs flex items-start gap-2 ${
+                phaseInfo.phase === 'SLOT_ONLY'
+                  ? 'bg-blue-50 border-blue-200 text-blue-900'
+                  : phaseInfo.phase === 'QUEUE_ONLY'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-amber-50 border-amber-200 text-amber-900'
+              }`}>
+                <span>{phaseInfo.phase === 'QUEUE_ONLY' ? '⏱️' : phaseInfo.phase === 'SLOT_ONLY' ? '📅' : '⚠️'}</span>
+                <div>
+                  <div className="font-bold">{phaseInfo.title}</div>
+                  <div className="text-[11px] opacity-90 mt-0.5">{phaseInfo.description}</div>
+                </div>
+              </div>
+
+              {/* 模式切換頁籤 (Tab) - 連動限制 */}
+              <div className="grid grid-cols-2 bg-slate-100 p-1 rounded-2xl gap-1">
+                <button
+                  type="button"
+                  className={`py-2 px-3 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all ${
+                    reservationType === '時段預約'
+                      ? 'bg-white text-blue-600 shadow-xs'
+                      : isSlotAllowed
+                      ? 'text-slate-600 hover:text-slate-900'
+                      : 'text-slate-400 bg-slate-100/50 cursor-pointer'
+                  }`}
+                  onClick={() => setReservationType('時段預約')}
+                >
+                  📅 時段預約 (24h前開放) {!isSlotAllowed && '🔒'}
+                </button>
+                <button
+                  type="button"
+                  className={`py-2 px-3 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all ${
+                    reservationType === '現場排隊'
+                      ? 'bg-white text-blue-600 shadow-xs'
+                      : isQueueAllowed
+                      ? 'text-slate-600 hover:text-slate-900'
+                      : 'text-slate-400 bg-slate-100/50 cursor-pointer'
+                  }`}
+                  onClick={() => setReservationType('現場排隊')}
+                >
+                  ⏱️ 現場排隊 (上課時開放) {!isQueueAllowed && '🔒'}
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">預約機台：</label>
+                <select
+                  className="w-full border border-slate-300 rounded-xl p-2.5 text-sm font-semibold bg-white text-slate-900"
+                  value={selectedMachineId}
+                  onChange={e => setSelectedMachineId(e.target.value)}
+                >
+                  {machines.map(m => (
+                    <option key={m.id} value={m.id}>{m.name} ({m.status})</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center mb-1.5">
+                  <label className="text-xs font-bold text-slate-700">選擇學生名單 (連動人數時長)：</label>
+                  <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-200">
+                    {selectedStudents.length} 人 ➔ {durationMinutes} 分鐘
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-50 p-3 rounded-2xl border border-slate-200 text-xs">
+                  {students.map(s => {
+                    const sel = selectedStudents.includes(s.name);
+                    return (
+                      <label key={s.id} className={`flex items-center gap-2 p-2 rounded-xl border cursor-pointer ${sel ? 'bg-blue-50 border-blue-300 text-blue-900 font-bold' : 'bg-white border-slate-200 text-slate-700'}`}>
+                        <input
+                          type="checkbox"
+                          checked={sel}
+                          onChange={() => toggleStudent(s.name)}
+                          className="rounded text-blue-600"
+                        />
+                        <span>{s.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {reservationType === '時段預約' ? (
+                <TimeTableMatrix
+                  machineId={selectedMachineId}
+                  durationMinutes={durationMinutes}
+                  selectedStartSlot={selectedSlotId}
+                  onSelectSlot={setSelectedSlotId}
+                />
+              ) : (
+                <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl space-y-2 text-xs">
+                  <p className="text-emerald-900 font-bold">現場排隊即時推算：</p>
+                  <p className="text-emerald-800">目前課程進行中，依據機台現有隊列為您推算之預計開始時間為：</p>
+                  <div className="bg-white p-3 rounded-xl border border-emerald-200 font-mono text-sm text-center font-bold text-slate-900">
+                    {minutesToTime(queueStartMin)} ～ {minutesToTime(queueStartMin + durationMinutes)}
+                  </div>
+                </div>
+              )}
+
+              <div className="pt-3 border-t border-slate-100 flex justify-end gap-3">
+                <button type="button" onClick={onClose} className="px-4 py-2.5 rounded-xl bg-slate-100 text-slate-700 text-xs font-semibold">取消</button>
+                <button type="submit" disabled={isSubmitting} className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-md shadow-blue-500/20">
+                  {isSubmitting ? '送出中...' : '確認送出申請'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 7. 機台卡片 (MachineCard) - 1:1 截圖 1
+    // ============================================================
+    function MachineCard({ machine, onOpenReservationModal }) {
+      const { startMachineUsage } = useApp();
+
+      let bgClass = 'status-idle';
+      let badge = '🟢 空閒';
+      let hex = '#E8F5E9';
+
+      if (machine.status === '使用中') {
+        bgClass = 'status-busy';
+        badge = '🔴 使用中';
+        hex = '#FFEBEE';
+      } else if (machine.status === '等待報到') {
+        bgClass = 'status-waiting';
+        badge = '🟡 等候報到';
+        hex = '#FFF8E1';
+      }
+
+      return (
+        <div className={`p-5 rounded-2xl shadow-xs border flex flex-col justify-between transition-all hover:shadow-md ${bgClass}`} style={{ backgroundColor: hex }}>
+          <div>
+            <div className="flex items-start justify-between mb-2">
+              <div>
+                <div className="w-9 h-9 rounded-full bg-black/5 flex items-center justify-center mb-2">
+                  <span className="text-base">🪚</span>
+                </div>
+                <h3 className="text-xl font-bold text-slate-900 leading-snug">{machine.name}</h3>
+                <p className="text-xs font-semibold text-slate-500 mt-0.5">空間</p>
+              </div>
+              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-white/80 border border-slate-200 shadow-2xs">
+                {badge}
+              </span>
+            </div>
+
+            <div className="mt-3 mb-4 pt-3 border-t border-black/5">
+              <p className="text-sm font-medium text-slate-800">
+                目前使用：{machine.currentUserName || '—'} 下一位：{machine.nextUserName || '—'}
+              </p>
+            </div>
+          </div>
+
+          <div className="pt-3 border-t border-black/5 flex items-center gap-2">
+            {machine.status === '空閒' && (
+              <button
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm"
+                onClick={() => onOpenReservationModal(machine.id)}
+              >
+                + 新增預約 / 排隊
+              </button>
+            )}
+
+            {machine.status === '等待報到' && (
+              <div className="flex-1 py-2 px-3 text-xs font-bold text-amber-800 bg-amber-100/70 rounded-xl text-center border border-amber-200/80 select-none flex items-center justify-center gap-1.5">
+                <span>⏱️ 等候同學報到中</span>
+              </div>
+            )}
+
+            {machine.status === '使用中' && (
+              <div className="flex-1 py-2 px-3 text-xs font-bold text-red-700/80 bg-red-100/60 rounded-xl text-center border border-red-200/60 select-none">
+                機台使用中
+              </div>
+            )}
+
+            <button
+              className="p-2.5 rounded-xl bg-white/70 hover:bg-white text-slate-600 border border-black/10 text-xs"
+              onClick={() => alert(`已複製機台【${machine.name}】狀態！`)}
+            >
+              🔗
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 8. 我的預約 (MyReservationsView) - 1:1 截圖 2 (精準綁定預約 ID)
+    // ============================================================
+    function MyReservationsView() {
+      const { reservations, activeUser, cancelReservation, startMachineUsage, finishMachineUsage, clearCompletedReservations } = useApp();
+      const [isClearing, setIsClearing] = useState(false);
+      
+      const myRes = reservations
+        .filter(r => r.email === activeUser.mail || r.students.includes(activeUser.name))
+        .sort((a, b) => {
+          const statusWeight = (s) => {
+            if (s === '使用中') return 1;
+            if (s === '等候報到') return 2;
+            if (s === '排隊中' || s === '等待中') return 3;
+            return 4;
+          };
+          const wDiff = statusWeight(a.status) - statusWeight(b.status);
+          if (wDiff !== 0) return wDiff;
+          return a.startMinutes - b.startMinutes;
+        });
+
+      const completedList = myRes.filter(r => r.status === '已完成' || r.status === '已取消');
+      const hasCompleted = completedList.length > 0;
+
+      const handleClearCompleted = async () => {
+        if (!hasCompleted) return alert('目前沒有已完成或已取消的歷史紀錄需要清除！');
+        const ok = window.confirm(`確定要清除【${activeUser.name}】所有的已完成預約紀錄嗎？\n\n共 ${completedList.length} 筆歷史紀錄將從 Database 中永久移除。`);
+        if (!ok) return;
+
+        setIsClearing(true);
+        try {
+          const res = await clearCompletedReservations();
+          alert(res.message);
+        } finally {
+          setIsClearing(false);
+        }
+      };
+
+      return (
+        <div className="space-y-3 pb-2">
+          {myRes.length === 0 ? (
+            <div className="bg-white rounded-3xl p-8 text-center border border-slate-200 text-slate-500 space-y-1">
+              <span className="text-3xl block mb-2">📋</span>
+              <p className="font-bold text-sm text-slate-800">目前尚無預約紀錄</p>
+              <p className="text-xs text-slate-400">請至「機台列表」點擊新增預約。</p>
+            </div>
+          ) : (
+            myRes.map(res => {
+              const finished = res.status === '已完成' || res.status === '已取消';
+              const isInUse = res.status === '使用中';
+
+              return (
+                <div key={res.id} className={`bg-white rounded-2xl p-5 shadow-xs border flex flex-col justify-between space-y-3 ${isInUse ? 'border-red-200 ring-1 ring-red-100 bg-red-50/10' : 'border-slate-200'}`}>
+                  <div>
+                    <h4 className="text-base font-bold text-slate-900">{res.students.join(', ')}</h4>
+                  </div>
+                  <div>
+                    <h3 className="text-2xl font-bold text-slate-900 mb-1">{res.machineName}</h3>
+                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                      <span className="bg-slate-100 text-slate-700 font-semibold px-2 py-0.5 rounded">{res.type}</span>
+                      <span>{res.startTimeFormatted} ～ {res.endTimeFormatted} ({res.durationMinutes}分)</span>
+                      <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${isInUse ? 'bg-red-50 text-red-600 border border-red-200' : res.status === '等候報到' ? 'bg-amber-50 text-amber-700 border border-amber-200' : 'text-blue-600'}`}>
+                        [{res.status}]
+                      </span>
+                    </div>
+                  </div>
+
+                  {!finished && (
+                    <div className="pt-3.5 border-t border-slate-100 flex items-center justify-between">
+                      {!isInUse ? (
+                        <button onClick={() => cancelReservation(res.id)} className="text-sm font-semibold text-blue-600 hover:text-blue-800">
+                          取消
+                        </button>
+                      ) : (
+                        <span className="text-xs text-slate-400 font-medium">使用中（結束請按右側按鈕）</span>
+                      )}
+
+                      {!isInUse ? (
+                        <button
+                          onClick={() => startMachineUsage(res.machineId, res.id)}
+                          className="w-10 h-10 rounded-full bg-slate-900 text-white flex items-center justify-center hover:bg-slate-800 shadow-md transition-transform active:scale-95"
+                          title="開始使用 (立即報到)"
+                        >
+                          ▶
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => finishMachineUsage(res.machineId, res.id)}
+                          className="w-10 h-10 rounded-full bg-red-600 text-white flex items-center justify-center hover:bg-red-700 shadow-md shadow-red-500/20 text-sm font-bold transition-transform active:scale-95"
+                          title="結束使用 (系統將自動呼叫下一位同學)"
+                        >
+                          ⏹
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+
+          {hasCompleted && (
+            <div className="pt-2 text-center">
+              <button
+                type="button"
+                disabled={isClearing}
+                onClick={handleClearCompleted}
+                className="w-full py-3 px-4 rounded-2xl bg-white hover:bg-red-50 text-red-600 border border-red-200 text-xs font-bold shadow-xs hover:border-red-300 transition-all flex items-center justify-center gap-2 active:scale-98"
+              >
+                <span>🗑️</span>
+                <span>{isClearing ? '正在自 Database 清除中...' : `清除已完成預約紀錄 (${completedList.length} 筆)`}</span>
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 9. 課程場次 (CourseSessionsView) - 1:1 截圖 3
+    // ============================================================
+    function CourseSessionsView() {
+      const { courseSessions, setCurrentCourseSession } = useApp();
+
+      return (
+        <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100 overflow-hidden shadow-xs">
+          {courseSessions.map(session => (
+            <div key={session.id} className="p-4 flex items-center justify-between hover:bg-slate-50">
+              <div className="space-y-1">
+                <span className={`inline-block text-xs font-bold px-2 py-0.5 rounded ${session.isCurrent ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
+                  {session.isCurrent ? 'Y' : 'N'}
+                </span>
+                <h4 className="text-base font-bold text-slate-800">
+                  {session.notes || `${session.sessionId}：${session.startTime.substring(0,5)}－${session.endTime.substring(0,5)}`}
+                </h4>
+              </div>
+
+              <div className="flex items-center gap-2 text-slate-500">
+                <button onClick={() => alert('預設場次不可刪除')} className="p-2 hover:text-red-600">🗑️</button>
+                <button onClick={() => alert(`編輯【${session.sessionId}】`)} className="p-2 hover:text-blue-600">✏️</button>
+                <button 
+                  onClick={() => {
+                    setCurrentCourseSession(session.id);
+                    alert(`已呼叫系統設定同步：設【${session.sessionId}】為目前場次！`);
+                  }}
+                  className={`p-2 ${session.isCurrent ? 'text-emerald-600 font-bold' : 'hover:text-emerald-600'}`}
+                >
+                  ✓
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 10. 預約設定 (BookingSettingsView) - 支援自動模式週三與手動自訂
+    // ============================================================
+    function BookingSettingsView() {
+      const { systemSettings, updateSettings } = useApp();
+      const [controlMode, setControlMode] = useState('自動');
+      const [startT, setStartT] = useState('');
+      const [endT, setEndT] = useState('');
+      const [grace, setGrace] = useState(5);
+      const [walkIn, setWalkIn] = useState(true);
+      const [saving, setSaving] = useState(false);
+
+      const isDirtyRef = React.useRef(false);
+      const isInitializedRef = React.useRef(false);
+
+      const toInput = (d) => {
+        if (!d) return '';
+        const date = new Date(d);
+        const yyyy = date.getFullYear();
+        const mm = (date.getMonth() + 1).toString().padStart(2, '0');
+        const dd = date.getDate().toString().padStart(2, '0');
+        const hh = date.getHours().toString().padStart(2, '0');
+        const min = date.getMinutes().toString().padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
+      };
+
+      useEffect(() => {
+        if (systemSettings && (!isInitializedRef.current || !isDirtyRef.current)) {
+          const mode = systemSettings.control_mode || systemSettings.controlMode || '自動';
+          setControlMode(mode);
+          setGrace(systemSettings.checkin_grace_minutes || 5);
+          setWalkIn(systemSettings.allow_walk_in_queue ?? true);
+
+          const eff = getEffectiveCourseTimes(systemSettings);
+          setStartT(toInput(eff.startTime));
+          setEndT(toInput(eff.endTime));
+          isInitializedRef.current = true;
+        }
+      }, [systemSettings]);
+
+      const handleModeSwitch = (newMode) => {
+        isDirtyRef.current = true;
+        setControlMode(newMode);
+        const eff = getEffectiveCourseTimes({ ...(systemSettings || {}), control_mode: newMode });
+        setStartT(toInput(eff.startTime));
+        setEndT(toInput(eff.endTime));
+      };
+
+      const handleTimeChange = (type, val) => {
+        isDirtyRef.current = true;
+        if (type === 'start') setStartT(val);
+        else setEndT(val);
+      };
+
+      const handleGraceChange = (delta) => {
+        isDirtyRef.current = true;
+        setGrace(g => Math.max(1, g + delta));
+      };
+
+      const handleWalkInChange = (val) => {
+        isDirtyRef.current = true;
+        setWalkIn(val);
+      };
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          await updateSettings({
+            control_mode: controlMode,
+            manual_course_start_time: controlMode === '手動' ? new Date(startT).toISOString() : null,
+            manual_course_end_time: controlMode === '手動' ? new Date(endT).toISOString() : null,
+            course_start_time: new Date(startT).toISOString(),
+            course_end_time: new Date(endT).toISOString(),
+            checkin_grace_minutes: grace,
+            allow_walk_in_queue: walkIn
+          });
+          isDirtyRef.current = false;
+          alert('預約設定已成功更新並同步至 Supabase！');
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      const handleCancel = () => {
+        isDirtyRef.current = false;
+        if (systemSettings) {
+          const mode = systemSettings.control_mode || systemSettings.controlMode || '自動';
+          setControlMode(mode);
+          setGrace(systemSettings.checkin_grace_minutes || 5);
+          setWalkIn(systemSettings.allow_walk_in_queue ?? true);
+
+          const eff = getEffectiveCourseTimes(systemSettings);
+          setStartT(toInput(eff.startTime));
+          setEndT(toInput(eff.endTime));
+        }
+        alert('已還原設定！');
+      };
+
+      return (
+        <form onSubmit={handleSave} className="bg-white rounded-3xl p-6 shadow-xs border border-slate-200 space-y-5">
+          {/* 模式切換 */}
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-2">預約控制模式：</label>
+            <div className="grid grid-cols-2 bg-slate-100 p-1 rounded-2xl">
+              <button
+                type="button"
+                className={`py-2 px-3 font-bold text-xs rounded-xl transition-all ${controlMode === '自動' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-600'}`}
+                onClick={() => handleModeSwitch('自動')}
+              >
+                ⚡ 自動模式 (固定週三)
+              </button>
+              <button
+                type="button"
+                className={`py-2 px-3 font-bold text-xs rounded-xl transition-all ${controlMode === '手動' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-600'}`}
+                onClick={() => handleModeSwitch('手動')}
+              >
+                ✏️ 手動模式 (自訂時段)
+              </button>
+            </div>
+          </div>
+
+          {/* 模式說明 */}
+          {controlMode === '自動' ? (
+            <div className="bg-blue-50 border border-blue-200 text-blue-900 p-3.5 rounded-2xl text-xs space-y-1">
+              <div className="font-bold">⚡ 自動模式運作規則：</div>
+              <p className="text-blue-800 leading-relaxed text-[11px]">
+                系統固定設定課程時間為<strong>「每週三 09:00 ~ 12:00」</strong>。<br/>
+                • 課程開始前 24 小時（每週二 09:00 起）：僅開放<strong>「時段預約」</strong>。<br/>
+                • 課程開始時（每週三 09:00 起）：僅開放<strong>「現場排隊」</strong>。
+              </p>
+            </div>
+          ) : (
+            <div className="bg-amber-50 border border-amber-200 text-amber-900 p-3.5 rounded-2xl text-xs space-y-1">
+              <div className="font-bold">✏️ 手動模式運作規則：</div>
+              <p className="text-amber-800 leading-relaxed text-[11px]">
+                允許自由修改下方<strong>「課程開始時間」</strong>與<strong>「課程結束時間」</strong>。<br/>
+                • 課程開始前 24 小時內：開放<strong>「時段預約」</strong>。<br/>
+                • 課程開始時：開放<strong>「現場排隊」</strong>。
+              </p>
+            </div>
+          )}
+
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-xs font-bold text-slate-700">課程開始時間</label>
+              {controlMode === '自動' && <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded">系統自動推算 (週三 09:00)</span>}
+            </div>
+            <input
+              type="datetime-local"
+              value={startT}
+              disabled={controlMode === '自動'}
+              onChange={e => handleTimeChange('start', e.target.value)}
+              className={`w-full border-2 rounded-xl p-3 text-sm font-semibold ${controlMode === '自動' ? 'bg-slate-50 border-slate-200 text-slate-500 cursor-not-allowed' : 'bg-white border-blue-600'}`}
+            />
+          </div>
+
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-xs font-bold text-slate-700">課程結束時間</label>
+              {controlMode === '自動' && <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded">系統自動推算 (週三 12:00)</span>}
+            </div>
+            <input
+              type="datetime-local"
+              value={endT}
+              disabled={controlMode === '自動'}
+              onChange={e => handleTimeChange('end', e.target.value)}
+              className={`w-full border-2 rounded-xl p-3 text-sm font-semibold ${controlMode === '自動' ? 'bg-slate-50 border-slate-200 text-slate-500 cursor-not-allowed' : 'bg-white border-slate-300'}`}
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">報到寬限分鐘</label>
+            <div className="flex items-center justify-between border border-slate-300 rounded-xl p-2 bg-white">
+              <span className="font-mono text-base font-bold text-slate-900 px-3">{grace}</span>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => handleGraceChange(-1)} className="w-9 h-9 rounded-lg bg-slate-100 font-bold">－</button>
+                <button type="button" onClick={() => handleGraceChange(1)} className="w-9 h-9 rounded-lg bg-slate-100 font-bold">＋</button>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">現場排隊開放</label>
+            <select
+              value={walkIn ? '開放' : '關閉'}
+              onChange={e => handleWalkInChange(e.target.value === '開放')}
+              className="w-full border border-slate-300 rounded-xl p-3 text-sm font-semibold bg-white"
+            >
+              <option value="開放">開放</option>
+              <option value="關閉">關閉</option>
+            </select>
+          </div>
+
+          <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
+            <button type="button" onClick={handleCancel} className="text-sm font-bold text-slate-600 hover:text-slate-900">Cancel</button>
+            <button type="submit" disabled={saving} className="px-6 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-bold">
+              {saving ? '儲存中...' : 'Save'}
+            </button>
+          </div>
+        </form>
+      );
+    }
+
+    // ============================================================
+    // 11. 主畫面排版 (MainLayout) - 純手機 App 排版 (Mobile-Only)
+    // ============================================================
+    function MainLayout() {
+      const { machines, activeTab, setActiveTab, activeUser, isLoggedIn, logout, refreshData } = useApp();
+      const [isResModalOpen, setIsResModalOpen] = useState(false);
+      const [selectedMacId, setSelectedMacId] = useState(null);
+
+      const openModal = (id) => {
+        setSelectedMacId(id || null);
+        setIsResModalOpen(true);
+      };
+
+      if (!isLoggedIn) {
+        return <LoginView />;
+      }
+
+      return (
+        <div className="min-h-screen bg-slate-900 py-0 sm:py-6 flex flex-col items-center justify-center">
+          <div className="w-full max-w-sm sm:max-w-md h-screen sm:h-[840px] bg-slate-50 sm:rounded-[44px] sm:border-[10px] sm:border-slate-800 shadow-2xl overflow-hidden flex flex-col relative">
+            {/* 頂部狀態列 */}
+            <div className="h-10 bg-white flex items-center justify-between px-6 text-xs font-semibold text-slate-800 border-b border-slate-100 select-none">
+              <span>09:41</span>
+              <span>📶 ⚡ 100%</span>
+            </div>
+
+            {/* 手機 App Header (1:1 截圖 1-4) */}
+            <div className="bg-white px-4 py-3 border-b border-slate-200 flex items-center justify-between shadow-2xs relative z-10">
+              <div className="flex items-center gap-2.5">
+                <button onClick={logout} className="p-1.5 text-slate-500 hover:text-red-600 rounded-xl hover:bg-slate-100 text-sm transition-colors" title="登出並返回驗證介面">
+                  🚪
+                </button>
+                <div>
+                  <h2 className="font-bold text-base text-slate-900 leading-tight">
+                    {activeTab === 'machines' && '機台列表'}
+                    {activeTab === 'reservations' && '我的預約'}
+                    {activeTab === 'courses' && '課程場次'}
+                    {activeTab === 'settings' && '預約設定'}
+                  </h2>
+                  <span className="text-[10px] text-slate-500 font-semibold block">
+                    👤 {activeUser.name} ({activeUser.mail})
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button onClick={refreshData} className="p-1.5 text-slate-600 hover:text-slate-900 text-sm" title="重新整理">🔄</button>
+                <button onClick={() => openModal()} className="w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md font-bold text-base transition-transform active:scale-95">
+                  ＋
+                </button>
+              </div>
+            </div>
+
+            {/* 內容區 */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-100/70">
+              {activeTab === 'machines' && (
+                <div className="space-y-3">
+                  {machines.map(m => (
+                    <MachineCard key={m.id} machine={m} onOpenReservationModal={openModal} />
+                  ))}
+                </div>
+              )}
+              {activeTab === 'reservations' && <MyReservationsView />}
+              {activeTab === 'courses' && <CourseSessionsView />}
+              {activeTab === 'settings' && <BookingSettingsView />}
+            </div>
+
+            {/* 底部導覽列 (1:1 截圖 1-4) */}
+            <div className="h-16 bg-white border-t border-slate-200 flex items-center justify-around z-20 select-none shadow-lg">
+              {[
+                { id: 'machines', label: '機台列表', icon: '🪚' },
+                { id: 'reservations', label: '我的預約', icon: '📋' },
+                { id: 'courses', label: '課程場次', icon: '📚' },
+                { id: 'settings', label: '預約設定', icon: '⚙️' }
+              ].map(t => {
+                const active = activeTab === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => setActiveTab(t.id)}
+                    className={`flex-1 h-full flex flex-col items-center justify-center gap-1 relative ${active ? 'text-blue-600 font-bold' : 'text-slate-500'}`}
+                  >
+                    <span className="text-lg">{t.icon}</span>
+                    <span className="text-[11px] leading-none">{t.label}</span>
+                    {active && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-12 h-1 bg-blue-600 rounded-t-full" />}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {isResModalOpen && (
+            <ReservationModal initialMachineId={selectedMacId} onClose={() => setIsResModalOpen(false)} />
+          )}
+        </div>
+      );
+    }
+
+    function App() {
+      return (
+        <AppProvider>
+          <MainLayout />
+        </AppProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
