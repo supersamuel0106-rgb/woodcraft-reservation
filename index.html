@@ -193,6 +193,62 @@
       localStorage.setItem(NOTIFIED_REMINDERS_KEY, JSON.stringify(notified));
     }
 
+    /**
+     * 發送小組預約 / 排隊成立通知 (包含發起人與所有被加入的小組成員)
+     */
+    async function sendGroupReservationNotification({
+      recipientName,
+      isCreator,
+      creatorName,
+      machineName,
+      type,
+      startTime,
+      endTime,
+      durationMinutes,
+      toEmail,
+      allStudentNames
+    }) {
+      const isGroup = allStudentNames && allStudentNames.length > 1;
+      const groupInfo = isGroup ? `（同組成員：${allStudentNames.join('、')}）` : '';
+
+      let title, body, subject;
+      if (isCreator) {
+        title = type === '時段預約' ? `【預約成功！📅】${machineName}` : `【排隊成功！🎟️】${machineName}`;
+        body = `親愛的 ${recipientName}：您已成功建立【${machineName}】的${type}！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n${groupInfo}`;
+        subject = `【${type}成功通知】您已建立【${machineName}】預約`;
+      } else {
+        title = type === '時段預約' ? `【您已被加入預約！👥】${machineName}` : `【您已被加入排隊！👥】${machineName}`;
+        body = `親愛的 ${recipientName}：${creatorName} 同學已將您加入【${machineName}】的${type}！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n${groupInfo}`;
+        subject = `【小組${type}通知】${creatorName} 同學已將您加入【${machineName}】`;
+      }
+
+      const tag = `group-res-${toEmail || recipientName}-${Date.now()}`;
+      sendBrowserNotification(title, body, tag);
+
+      if (toEmail) {
+        await sendEmailNotification({
+          to_email: toEmail,
+          to_name: recipientName,
+          subject,
+          machine_name: machineName,
+          start_time: startTime,
+          end_time: endTime,
+          duration_minutes: durationMinutes,
+          message: body,
+          notification_type: `${type}成立`
+        });
+      }
+
+      return {
+        id: `N_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        timestamp: new Date().toLocaleTimeString('zh-TW'),
+        recipientName,
+        machineName,
+        subject,
+        body
+      };
+    }
+
     // ============================================================
     // 1d. 老師與助教 (管理員) 權限名單
     // ============================================================
@@ -846,6 +902,28 @@
         if (error) {
           console.error('Supabase error:', error);
           return { success: false, message: `資料庫儲存失敗：${error.message}` };
+        }
+
+        // NOTE: 發送通知給所有名單中的同學（包含發起人本人與所有被加入的小組成員）
+        for (const sName of data.students) {
+          const matched = students.find(s => s.name === sName);
+          const studentEmail = matched?.mail || (sName === activeUser.name ? activeUser.mail : '');
+          const isCreator = (sName === activeUser.name) || (studentEmail && activeUser.mail && studentEmail.toLowerCase() === activeUser.mail.toLowerCase());
+
+          sendGroupReservationNotification({
+            recipientName: sName,
+            isCreator,
+            creatorName: activeUser.name,
+            machineName: targetMac.name,
+            type: data.type,
+            startTime: minutesToTime(startMin),
+            endTime: minutesToTime(endMin),
+            durationMinutes: duration,
+            toEmail: studentEmail,
+            allStudentNames: data.students
+          }).then(notif => {
+            setNotifications(prev => [notif, ...prev]);
+          }).catch(e => console.warn('Group notification error:', e));
         }
 
         await refreshData();
