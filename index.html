@@ -142,7 +142,7 @@
      */
     async function sendQueueCallNotification({ studentNames, machineName, startTime, endTime, durationMinutes, toEmail }) {
       const title = `【輪到您了！🎟️】${machineName}`;
-      const body = `${studentNames}，您的機台已可使用！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n請於 5 分鐘內前往工廠報到，逾時將視為放棄。`;
+      const body = `${studentNames}，您的機台已可使用！\n時段：${startTime} ～ ${endTime}（${durationMinutes} 分鐘）\n請於 3 分鐘內前往工廠報到，逾時將視為放棄。`;
       const tag = `queue-call-${toEmail}-${Date.now()}`;
 
       sendBrowserNotification(title, body, tag);
@@ -504,6 +504,7 @@
             email: row.email,
             createdAt: row.created_at,
             calledAt: row.called_at,
+            advanceOfferedAt: row.advance_offered_at,
             notes: row.notes
           }));
           const rawStudents = (sRes.data || []).map(row => ({ id: row.id, name: row.name, studentNumber: row.student_number, mail: row.mail, role: row.role }));
@@ -511,7 +512,7 @@
 
           const updatedMachines = rawMachines.map(mac => {
             const inUse = rawReservations.find(r => r.machineId === mac.id && r.status === '使用中');
-            const waitCheckin = rawReservations.find(r => r.machineId === mac.id && r.status === '等候報到');
+            const waitCheckin = rawReservations.find(r => r.machineId === mac.id && (r.status === '等候報到' || r.status === '等候提前確認'));
             const nextW = getNextQueueWaiter(rawReservations, mac.id);
 
             let computed = '空閒';
@@ -560,8 +561,10 @@
       }, [refreshData]);
 
       // NOTE: 推進機台隊列核心邏輯
-      // 規則：時段預約固定時間不變（不往前拉）；只有現場排隊者會在機台空閒時往前遞補
-      const advanceQueueForMachine = useCallback(async (machineId, reservationsSnapshot) => {
+      // 規則：
+      // 1. 若下一位是「現場排隊」：不用問，直接叫號（給予 3 分鐘報到緩衝）
+      // 2. 若下一位是「時段預約」：發出提前使用邀請（App 頂部顯示 3 分鐘確認倒數），若同意則提前使用，若拒絕或逾時則保留原時段並叫號再下一位！
+      const advanceQueueForMachine = useCallback(async (machineId, reservationsSnapshot, excludeOfferResIds = []) => {
         const sourceRes = reservationsSnapshot || reservations;
         const now = new Date();
         const nowMinutes = now.getHours() * 60 + now.getMinutes();
@@ -569,18 +572,35 @@
         // 取得該機台尚未完成且未取消的所有預約
         const activeResList = sourceRes.filter(r => 
           r.machineId === machineId && 
-          (r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中')
+          (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中')
         );
 
-        const queueList = activeResList
-          .filter(r => r.type === '現場排隊')
-          .sort((a, b) => a.startMinutes - b.startMinutes);
+        if (activeResList.length === 0) {
+          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          return;
+        }
 
-        const slotList = activeResList
-          .filter(r => r.type === '時段預約')
-          .sort((a, b) => a.startMinutes - b.startMinutes);
+        const queueList = activeResList.filter(r => r.type === '現場排隊').sort((a, b) => a.startMinutes - b.startMinutes);
+        const slotList = activeResList.filter(r => r.type === '時段預約').sort((a, b) => a.startMinutes - b.startMinutes);
+        const eligibleSlotList = slotList.filter(s => !excludeOfferResIds.includes(s.id));
 
+        // 決定下一位候補者：
+        // 1. 若有現場排隊者，優先叫號（因人就在現場）
+        // 2. 若無現場排隊，但有後續時段預約，則向最近的時段預約者詢問是否提前
+        let nextCandidate = null;
         if (queueList.length > 0) {
+          nextCandidate = queueList[0];
+        } else if (eligibleSlotList.length > 0) {
+          nextCandidate = eligibleSlotList[0];
+        }
+
+        if (!nextCandidate) {
+          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          return;
+        }
+
+        if (nextCandidate.type === '現場排隊') {
+          // --- Case A: 現場排隊 ➔ 直接叫號 (3 分鐘報到緩衝) ---
           let runningStartMin = nowMinutes;
 
           for (let i = 0; i < queueList.length; i++) {
@@ -591,7 +611,6 @@
             let candStart = runningStartMin;
             const dur = item.durationMinutes || 20;
 
-            // 若現場排隊時段與已固定的時段預約重疊，自動順延到該時段預約結束後
             for (const slot of slotList) {
               if (candStart < slot.endMinutes && candStart + dur > slot.startMinutes) {
                 candStart = Math.max(candStart, slot.endMinutes);
@@ -607,11 +626,11 @@
             };
             if (isFirst) {
               updatePayload.called_at = new Date().toISOString();
+              updatePayload.advance_offered_at = null;
             }
 
             await supabaseClient.from('reservations').update(updatePayload).eq('id', item.id);
 
-            // 第一位被叫號者發送通知
             if (isFirst) {
               sendQueueCallNotification({
                 studentNames: item.students.join(', '),
@@ -628,7 +647,7 @@
                 recipientName: item.students.join(', '),
                 machineName: item.machineName,
                 subject: '【叫號通知】輪到您使用機台了！',
-                body: `親愛的 ${item.students.join(', ')} 同學：您排隊的【${item.machineName}】已輪到您，時段為 ${minutesToTime(candStart)} ～ ${minutesToTime(candStart + dur)}，請於 5 分鐘內前往工廠報到！`
+                body: `親愛的 ${item.students.join(', ')} 同學：您排隊的【${item.machineName}】已輪到您，時段為 ${minutesToTime(candStart)} ～ ${minutesToTime(candStart + dur)}，請於 3 分鐘內前往工廠報到！`
               };
               setNotifications(prev => [notif, ...prev]);
             }
@@ -638,38 +657,110 @@
 
           await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
         } else {
-          // 沒有現場排隊，檢查是否有即將開始的時段預約（5分鐘內）
-          const nextSlot = slotList[0];
-          if (nextSlot && Math.abs(nextSlot.startMinutes - nowMinutes) <= 5) {
-            await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
-          } else {
-            await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', machineId);
+          // --- Case B: 時段預約 ➔ 發出提前詢問（App 頂部顯示 3 分鐘確認倒數） ---
+          const updatePayload = {
+            status: '等候提前確認',
+            advance_offered_at: new Date().toISOString()
+          };
+
+          await supabaseClient.from('reservations').update(updatePayload).eq('id', nextCandidate.id);
+
+          const offerTitle = `【機台提早空出！🪚】${nextCandidate.machineName}`;
+          const offerBody = `親愛的 ${nextCandidate.students.join(', ')} 同學：您預約的【${nextCandidate.machineName}】目前已有空檔，請問是否要提前現在開始使用？請於 3 分鐘內於 App 頂部確認。`;
+          sendBrowserNotification(offerTitle, offerBody, `early-offer-${nextCandidate.id}`);
+
+          if (nextCandidate.email) {
+            sendEmailNotification({
+              to_email: nextCandidate.email,
+              to_name: nextCandidate.students.join(', '),
+              subject: `【提早使用詢問】${nextCandidate.machineName} 目前已有空檔，是否提前開始？`,
+              machine_name: nextCandidate.machineName,
+              start_time: nextCandidate.startTimeFormatted,
+              end_time: nextCandidate.endTimeFormatted,
+              duration_minutes: nextCandidate.durationMinutes,
+              message: offerBody,
+              notification_type: '提前詢問'
+            });
           }
+
+          const notif = {
+            id: `N_${Date.now()}`,
+            timestamp: new Date().toLocaleTimeString('zh-TW'),
+            recipientName: nextCandidate.students.join(', '),
+            machineName: nextCandidate.machineName,
+            subject: '【提早使用詢問】機台目前已有空檔',
+            body: offerBody
+          };
+          setNotifications(prev => [notif, ...prev]);
+
+          await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', machineId);
         }
       }, [reservations]);
 
+      // 同意提前開始使用
+      const acceptEarlyStart = async (reservationId) => {
+        const target = reservations.find(r => r.id === reservationId);
+        if (!target) return;
+
+        const now = new Date();
+        const nowMinutes = now.getHours() * 60 + now.getMinutes();
+        const newEnd = nowMinutes + target.durationMinutes;
+
+        await supabaseClient.from('reservations').update({
+          status: '使用中',
+          start_minutes: nowMinutes,
+          end_minutes: newEnd,
+          start_time_formatted: minutesToTime(nowMinutes),
+          end_time_formatted: minutesToTime(newEnd),
+          started_at: now.toISOString(),
+          advance_offered_at: null
+        }).eq('id', reservationId);
+
+        await supabaseClient.from('machines').update({ status: '使用中' }).eq('id', target.machineId);
+        await refreshData();
+      };
+
+      // 婉拒提前開始（保持原本預約時段，機會轉交下一位）
+      const declineEarlyStart = async (reservationId) => {
+        const target = reservations.find(r => r.id === reservationId);
+        if (!target) return;
+
+        await supabaseClient.from('reservations').update({
+          status: '排隊中',
+          advance_offered_at: null,
+          notes: '已保留原時段（婉拒提前）'
+        }).eq('id', reservationId);
+
+        const updatedSnapshot = reservations.map(r => 
+          r.id === reservationId ? { ...r, status: '排隊中', advanceOfferedAt: null } : r
+        );
+        await advanceQueueForMachine(target.machineId, updatedSnapshot, [reservationId]);
+        await refreshData();
+      };
+
       // NOTE: 自動過號與逾時取消掃描機制（每 8 秒自動輪詢）
-      // 1. 現場排隊叫號 5 分鐘未報到 ➔ 自動跳過、叫下一位
-      // 2. 時段預約開始後 5 分鐘未報到 ➔ 自動取消該時段，釋出給現場排隊遞補，但後面的時段預約保持固定不變
+      // 1. 現場排隊叫號 3 分鐘未報到 ➔ 自動跳過、叫下一位
+      // 2. 時段預約提前詢問 3 分鐘未回應 ➔ 保留原時段、叫下一位
+      // 3. 時段預約開始後 3 分鐘未報到 ➔ 自動取消該時段，釋出給現場排隊遞補
       useEffect(() => {
         const scanTimeout = async () => {
           if (!supabaseClient || isCoursePaused || reservations.length === 0) return;
 
           const now = new Date();
           const currentMin = now.getHours() * 60 + now.getMinutes();
-          const graceMin = systemSettings?.checkin_grace_minutes || 5;
+          const graceMin = systemSettings?.checkin_grace_minutes !== undefined ? systemSettings.checkin_grace_minutes : 3;
           const graceMs = graceMin * 60 * 1000;
 
           let updatedAny = false;
           const machinesToAdvance = new Set();
 
           for (const r of reservations) {
-            // 規則 1: 現場排隊等候報到 逾時 5 分鐘未開始使用 -> 自動過號
+            // 規則 1: 現場排隊等候報到 逾時 3 分鐘未開始使用 -> 自動過號
             if (r.type === '現場排隊' && r.status === '等候報到') {
               if (r.calledAt) {
                 const calledTime = new Date(r.calledAt).getTime();
                 if (now.getTime() - calledTime >= graceMs) {
-                  console.log(`[Auto-Skip] 現場排隊叫號逾時未報到：${r.id} (${r.students.join(', ')})`);
+                  console.log(`[Auto-Skip] 現場排隊叫號逾時 3 分鐘未報到：${r.id} (${r.students.join(', ')})`);
                   await supabaseClient.from('reservations').update({
                     status: '未報到',
                     cancelled_at: now.toISOString()
@@ -691,7 +782,35 @@
               }
             }
 
-            // 規則 2: 時段預約開始後超過 5 分鐘未開始使用 -> 自動取消該時段
+            // 規則 2: 時段預約等候提前確認 逾時 3 分鐘未回應 -> 保留原時段，自動叫下一位
+            if (r.type === '時段預約' && r.status === '等候提前確認') {
+              if (r.advanceOfferedAt) {
+                const offerTime = new Date(r.advanceOfferedAt).getTime();
+                if (now.getTime() - offerTime >= graceMs) {
+                  console.log(`[Early-Offer-Timeout] 時段預約提前詢問 3 分鐘逾時未回應：${r.id} (${r.students.join(', ')})`);
+                  await supabaseClient.from('reservations').update({
+                    status: '排隊中',
+                    advance_offered_at: null,
+                    notes: '提前確認逾時，已為您保留原預約時段'
+                  }).eq('id', r.id);
+
+                  const notif = {
+                    id: `N_${Date.now()}`,
+                    timestamp: now.toLocaleTimeString('zh-TW'),
+                    recipientName: r.students.join(', '),
+                    machineName: r.machineName,
+                    subject: '【保留原時段】提前使用確認已逾時',
+                    body: `親愛的 ${r.students.join(', ')} 同學：您預約的【${r.machineName}】因未於 ${graceMin} 分鐘內確認提前，系統已為您保留原預約時段（${r.startTimeFormatted} ～ ${r.endTimeFormatted}），並將提前機會讓給下一位同學。`
+                  };
+                  setNotifications(prev => [notif, ...prev]);
+
+                  machinesToAdvance.add(r.machineId);
+                  updatedAny = true;
+                }
+              }
+            }
+
+            // 規則 3: 時段預約到達原本預約時間後，超過 3 分鐘未開始使用 -> 自動取消該時段
             if (r.type === '時段預約' && (r.status === '排隊中' || r.status === '等候報到')) {
               if (currentMin >= r.startMinutes + graceMin) {
                 console.log(`[Auto-Cancel] 時段預約逾時未報到：${r.id} (${r.students.join(', ')})`);
@@ -716,7 +835,7 @@
             }
           }
 
-          // 對有變動的機台推進現場排隊隊列
+          // 對有變動的機台推進隊列
           for (const macId of machinesToAdvance) {
             await advanceQueueForMachine(macId);
           }
@@ -1146,6 +1265,8 @@
           cancelReservation,
           clearCompletedReservations,
           setCurrentCourseSession,
+          acceptEarlyStart,
+          declineEarlyStart,
           updateSettings,
           refreshData
         }}>
@@ -2629,10 +2750,114 @@
     }
 
     // ============================================================
+    // 10.8 提前使用確認橫幅 (EarlyOfferBanner)
+    // 當機台提早空出，向下一位時段預約同學跳出 3 分鐘確認倒數橫幅
+    // ============================================================
+    function EarlyOfferBanner({ reservation, onAccept, onDecline }) {
+      const [remainingSec, setRemainingSec] = useState(180);
+      const [isSubmitting, setIsSubmitting] = useState(false);
+
+      useEffect(() => {
+        if (!reservation?.advanceOfferedAt) {
+          setRemainingSec(180);
+          return;
+        }
+
+        const updateTimer = () => {
+          const offerTime = new Date(reservation.advanceOfferedAt).getTime();
+          const elapsed = Math.floor((Date.now() - offerTime) / 1000);
+          const left = Math.max(0, 180 - elapsed);
+          setRemainingSec(left);
+        };
+
+        updateTimer();
+        const timer = setInterval(updateTimer, 1000);
+        return () => clearInterval(timer);
+      }, [reservation]);
+
+      const formatCountdown = (sec) => {
+        const mm = Math.floor(sec / 60).toString().padStart(2, '0');
+        const ss = (sec % 60).toString().padStart(2, '0');
+        return `${mm}:${ss}`;
+      };
+
+      const handleAccept = async () => {
+        setIsSubmitting(true);
+        try {
+          await onAccept();
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
+      const handleDecline = async () => {
+        setIsSubmitting(true);
+        try {
+          await onDecline();
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
+      return (
+        <div className="bg-gradient-to-r from-blue-700 via-indigo-700 to-indigo-800 text-white p-4 shadow-xl z-30 select-none border-b-2 border-indigo-400/30">
+          <div className="flex items-start justify-between gap-3 mb-2.5">
+            <div className="flex items-center gap-2">
+              <span className="text-2xl animate-bounce">🪚</span>
+              <div>
+                <div className="font-extrabold text-sm text-amber-300 flex items-center gap-1.5 flex-wrap">
+                  <span>【機台提早空出詢問】</span>
+                  <span className="bg-amber-400 text-slate-950 font-mono text-[11px] px-2 py-0.5 rounded-full font-black">
+                    ⏱️ 剩餘 {formatCountdown(remainingSec)}
+                  </span>
+                </div>
+                <div className="text-xs text-blue-100 font-medium mt-1 leading-relaxed">
+                  您預約的【<strong>{reservation.machineName}</strong>】（原時段 {reservation.startTimeFormatted} ～ {reservation.endTimeFormatted}）目前已有空檔，請問是否要提前現在開始使用？
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 mt-3">
+            <button
+              type="button"
+              disabled={isSubmitting}
+              onClick={handleAccept}
+              className="py-2.5 px-3 bg-emerald-500 hover:bg-emerald-600 active:scale-95 rounded-xl font-bold text-xs text-white shadow-md shadow-emerald-600/30 flex items-center justify-center gap-1 cursor-pointer transition-transform"
+            >
+              <span>✅ 提前開始使用</span>
+            </button>
+            <button
+              type="button"
+              disabled={isSubmitting}
+              onClick={handleDecline}
+              className="py-2.5 px-3 bg-white/20 hover:bg-white/30 active:scale-95 rounded-xl font-bold text-xs text-white flex items-center justify-center gap-1 cursor-pointer transition-transform border border-white/30"
+            >
+              <span>❌ 保持原時段</span>
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
     // 11. 主畫面排版 (MainLayout) - 純手機 App 排版 (Mobile-Only)
     // ============================================================
     function MainLayout() {
-      const { machines, activeTab, setActiveTab, activeUser, isLoggedIn, logout, refreshData, isCoursePaused, coursePausedAt } = useApp();
+      const { 
+        machines, 
+        activeTab, 
+        setActiveTab, 
+        activeUser, 
+        isLoggedIn, 
+        logout, 
+        refreshData, 
+        isCoursePaused, 
+        coursePausedAt,
+        reservations,
+        acceptEarlyStart,
+        declineEarlyStart
+      } = useApp();
       const [isResModalOpen, setIsResModalOpen] = useState(false);
       const [selectedMacId, setSelectedMacId] = useState(null);
       // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
@@ -2640,6 +2865,12 @@
 
       // NOTE: 檢查目前登入者是否為老師 / 助教 / 管理員 (例如 supersamuel0106@gmail.com)
       const isAdmin = isTeacherOrTA(activeUser);
+
+      // 檢查目前登入者是否有收到「提早使用詢問」的預約 (包含個人或小組成員)
+      const earlyOfferRes = (reservations || []).find(r => 
+        r.status === '等候提前確認' && 
+        (r.email === activeUser?.mail || (r.students || []).includes(activeUser?.name))
+      );
 
       // 若非管理員且當前在管理頁面，自動切回機台列表
       useEffect(() => {
@@ -2719,6 +2950,15 @@
                 )}
               </div>
             </div>
+
+            {/* NOTE: 提前使用詢問全域頂部互動 Banner (App 最上方跳出通知問他是否需要提前) */}
+            {earlyOfferRes && (
+              <EarlyOfferBanner
+                reservation={earlyOfferRes}
+                onAccept={() => acceptEarlyStart(earlyOfferRes.id)}
+                onDecline={() => declineEarlyStart(earlyOfferRes.id)}
+              />
+            )}
 
             {/* NOTE: 課程暫停全域醒目廣播 Banner (對所有頁面與所有師生可見) */}
             {isCoursePaused && (
