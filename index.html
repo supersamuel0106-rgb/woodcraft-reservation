@@ -584,14 +584,28 @@
         const slotList = activeResList.filter(r => r.type === '時段預約').sort((a, b) => a.startMinutes - b.startMinutes);
         const eligibleSlotList = slotList.filter(s => !excludeOfferResIds.includes(s.id));
 
+        // 篩選出在目前空檔 [nowMinutes, nowMinutes + duration] 於其他機台「沒有預約或排隊衝突」的候選人
+        // 規則：若預備提前/叫號的那位同學在該時段本來預計有其他機台的預約或排隊，則直接跳過！
+        const availableQueueList = queueList.filter(item => {
+          const dur = item.durationMinutes || 20;
+          const conflict = findStudentConflict(sourceRes, item.students, item.email, nowMinutes, dur, item.id);
+          return !conflict;
+        });
+
+        const availableSlotList = eligibleSlotList.filter(slot => {
+          const dur = slot.durationMinutes || 20;
+          const conflict = findStudentConflict(sourceRes, slot.students, slot.email, nowMinutes, dur, slot.id);
+          return !conflict;
+        });
+
         // 決定下一位候補者：
-        // 1. 若有現場排隊者，優先叫號（因人就在現場）
-        // 2. 若無現場排隊，但有後續時段預約，則向最近的時段預約者詢問是否提前
+        // 1. 若有現場排隊者（且目前時段無跨機台衝突），優先叫號
+        // 2. 若無現場排隊，但有後續時段預約（且目前時段無跨機台衝突），向最近者發出提前詢問
         let nextCandidate = null;
-        if (queueList.length > 0) {
-          nextCandidate = queueList[0];
-        } else if (eligibleSlotList.length > 0) {
-          nextCandidate = eligibleSlotList[0];
+        if (availableQueueList.length > 0) {
+          nextCandidate = availableQueueList[0];
+        } else if (availableSlotList.length > 0) {
+          nextCandidate = availableSlotList[0];
         }
 
         if (!nextCandidate) {
@@ -705,6 +719,14 @@
         const now = new Date();
         const nowMinutes = now.getHours() * 60 + now.getMinutes();
         const newEnd = nowMinutes + target.durationMinutes;
+
+        // 再次確認接受提前時是否有跨機台衝突
+        const conflict = findStudentConflict(reservations, target.students, target.email, nowMinutes, target.durationMinutes, target.id);
+        if (conflict) {
+          alert(`⚠️ 無法提前：名單中的同學在【${conflict.machineName}】已有時段（${conflict.startTimeFormatted} ～ ${conflict.endTimeFormatted}），同時間不可重複使用！已為您保留原預約時段。`);
+          await declineEarlyStart(reservationId);
+          return;
+        }
 
         await supabaseClient.from('reservations').update({
           status: '使用中',
