@@ -1885,22 +1885,51 @@
     function MachineDetailView({ machine, onBack, onOpenReservationModal }) {
       const { reservations, systemSettings } = useApp();
 
-      // 取得此機台的有效排隊（排除已完成/已取消）
-      const machineReservations = reservations
-        .filter(r => r.machineId === machine.id && (r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中'))
-        .sort((a, b) => a.startMinutes - b.startMinutes);
+      // 檢查是否為當天日期（隔天自動清除歷史紀錄）
+      const isToday = (dateStr) => {
+        if (!dateStr) return true;
+        const d = new Date(dateStr);
+        if (isNaN(d.getTime())) return true;
+        const now = new Date();
+        return d.getFullYear() === now.getFullYear() &&
+               d.getMonth() === now.getMonth() &&
+               d.getDate() === now.getDate();
+      };
 
-      // 計算最快可用時段（動態佇列算法）
+      // 取得此機台的當日預約清單（順序：使用過 → 正在使用 → 未來使用）
+      const machineReservations = useMemo(() => {
+        // 1. 當天已完成（使用過）
+        const completedList = reservations
+          .filter(r => r.machineId === machine.id && r.status === '已完成' && isToday(r.createdAt || r.created_at))
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        // 2. 正在使用中
+        const inUseList = reservations
+          .filter(r => r.machineId === machine.id && r.status === '使用中');
+
+        // 3. 未來使用（等候報到、等候提前確認、排隊中、等待中）
+        const upcomingList = reservations
+          .filter(r => r.machineId === machine.id && (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中'))
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        return [...completedList, ...inUseList, ...upcomingList];
+      }, [reservations, machine.id]);
+
+      // 計算最快可用時段（排除已完成的歷史紀錄）
       const getNextAvailableTime = () => {
         const now = new Date();
         const currentMin = now.getHours() * 60 + now.getMinutes();
         const roundedNow = Math.ceil(currentMin / 10) * 10;
 
-        if (machineReservations.length === 0) {
+        const activeUpcoming = machineReservations.filter(r => 
+          r.status === '使用中' || r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中'
+        );
+
+        if (activeUpcoming.length === 0) {
           return `現在可立即使用（${minutesToTime(roundedNow)} 起）`;
         }
 
-        const lastRes = machineReservations[machineReservations.length - 1];
+        const lastRes = activeUpcoming[activeUpcoming.length - 1];
         const nextStart = Math.max(lastRes.endMinutes, roundedNow);
         return `${minutesToTime(nextStart)} 開始`;
       };
@@ -1916,13 +1945,15 @@
       if (machine.status === '使用中') hex = '#FFEBEE';
       else if (machine.status === '等待報到') hex = '#FFF8E1';
 
+      const completedCount = machineReservations.filter(r => r.status === '已完成').length;
+
       return (
         <div className="space-y-3">
           {/* 頂部返回列 */}
           <div className="flex items-center gap-3">
             <button
               onClick={onBack}
-              className="p-2 rounded-xl bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors shadow-xs"
+              className="p-2 rounded-xl bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors shadow-xs cursor-pointer"
             >
               ← 返回
             </button>
@@ -1948,13 +1979,20 @@
             </div>
           </div>
 
-          {/* 目前排隊清單 */}
+          {/* 目前排隊與預約清單 */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-100 flex items-center gap-2">
-              <span className="text-sm font-bold text-slate-800">📋 目前預約排隊清單</span>
-              <span className="text-[11px] bg-slate-100 text-slate-500 font-semibold px-2 py-0.5 rounded-full">
-                {machineReservations.length} 組
-              </span>
+            <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-bold text-slate-800">📋 目前預約排隊清單</span>
+                <span className="text-[11px] bg-slate-100 text-slate-500 font-semibold px-2 py-0.5 rounded-full">
+                  {machineReservations.length} 組
+                </span>
+              </div>
+              {completedCount > 0 && (
+                <span className="text-[10px] text-slate-400 font-medium">
+                  含當日已使用 {completedCount} 組
+                </span>
+              )}
             </div>
 
             {machineReservations.length === 0 ? (
@@ -1965,34 +2003,71 @@
               </div>
             ) : (
               <div className="divide-y divide-slate-50">
-                {machineReservations.map((res, index) => (
-                  <div key={res.id} className="px-4 py-3 flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      {/* 順序號碼 */}
-                      <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${
-                        res.status === '使用中' ? 'bg-red-100 text-red-600' :
-                        res.status === '等候報到' ? 'bg-amber-100 text-amber-700' :
-                        'bg-slate-100 text-slate-600'
-                      }`}>
-                        {index + 1}
+                {machineReservations.map((res, index) => {
+                  const isCompleted = res.status === '已完成';
+                  const isInUse = res.status === '使用中';
+
+                  let rowClass = "bg-white hover:bg-slate-50/60";
+                  let numBadgeClass = "bg-slate-100 text-slate-600 font-medium";
+                  let nameClass = "text-sm font-normal text-slate-800";
+                  let timeClass = "text-sm font-normal text-slate-700";
+                  let subTextClass = "text-xs text-slate-500";
+                  let statusBadgeClass = "bg-blue-50 text-blue-600 font-normal";
+
+                  if (isCompleted) {
+                    // 1. 使用過的同學：飽和度較低的灰色／灰階顯示
+                    rowClass = "bg-slate-50/80 opacity-60 grayscale border-b border-slate-100/60";
+                    numBadgeClass = "bg-slate-200/80 text-slate-400 font-medium";
+                    nameClass = "text-sm font-normal text-slate-400";
+                    timeClass = "text-sm font-normal text-slate-400";
+                    subTextClass = "text-[11px] text-slate-400";
+                    statusBadgeClass = "bg-slate-200/70 text-slate-500 font-normal border border-slate-300/40";
+                  } else if (isInUse) {
+                    // 2. 正在使用中的同學：凸顯明顯一點，字體相較於其他字體加粗
+                    rowClass = "bg-red-50/80 border-l-4 border-l-red-500 border-red-200 ring-1 ring-red-200/40 shadow-xs";
+                    numBadgeClass = "bg-red-500 text-white font-black animate-pulse shadow-sm";
+                    nameClass = "text-base font-extrabold text-red-950";
+                    timeClass = "text-sm font-extrabold text-red-900";
+                    subTextClass = "text-xs font-bold text-red-600";
+                    statusBadgeClass = "bg-red-100 text-red-700 font-black px-2 py-0.5 shadow-2xs";
+                  } else {
+                    // 3. 未來使用的同學：一般字體
+                    if (res.status === '等候報到') {
+                      statusBadgeClass = "bg-amber-50 text-amber-700 font-semibold border border-amber-200";
+                      numBadgeClass = "bg-amber-100 text-amber-800 font-bold";
+                      nameClass = "text-sm font-semibold text-slate-900";
+                    } else if (res.status === '等候提前確認') {
+                      statusBadgeClass = "bg-indigo-50 text-indigo-700 font-semibold border border-indigo-200";
+                      numBadgeClass = "bg-indigo-100 text-indigo-800 font-bold";
+                      nameClass = "text-sm font-semibold text-slate-900";
+                    }
+                  }
+
+                  return (
+                    <div key={res.id} className={`px-4 py-3 flex items-center justify-between transition-all ${rowClass}`}>
+                      <div className="flex items-center gap-3">
+                        {/* 順序號碼 */}
+                        <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs flex-shrink-0 ${numBadgeClass}`}>
+                          {isCompleted ? '✓' : index + 1}
+                        </div>
+                        <div>
+                          <p className={nameClass}>
+                            {res.students.join(', ')}
+                            {isInUse && <span className="ml-1.5 text-xs text-red-600 font-black">● 正在使用</span>}
+                            {isCompleted && <span className="ml-1 text-[11px] text-slate-400 font-normal">（已使用）</span>}
+                          </p>
+                          <p className={subTextClass}>{res.type}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-sm font-bold text-slate-900">{res.students.join(', ')}</p>
-                        <p className="text-xs text-slate-500">{res.type}</p>
+                      <div className="text-right">
+                        <p className={timeClass}>{res.startTimeFormatted} ～ {res.endTimeFormatted}</p>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded inline-block mt-0.5 ${statusBadgeClass}`}>
+                          {isCompleted ? '已使用' : res.status}
+                        </span>
                       </div>
                     </div>
-                    <div className="text-right">
-                      <p className="text-sm font-bold text-slate-800">{res.startTimeFormatted} ～ {res.endTimeFormatted}</p>
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                        res.status === '使用中' ? 'bg-red-50 text-red-600' :
-                        res.status === '等候報到' ? 'bg-amber-50 text-amber-700' :
-                        'bg-blue-50 text-blue-600'
-                      }`}>
-                        {res.status}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
