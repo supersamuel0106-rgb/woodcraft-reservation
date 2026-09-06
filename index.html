@@ -1950,11 +1950,11 @@
           <div className="flex items-center gap-3">
             <button
               onClick={onBack}
-              className="p-2 rounded-xl bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors shadow-xs cursor-pointer"
+              className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 font-bold text-xs transition-colors shadow-xs cursor-pointer flex items-center gap-1"
             >
-              ← 返回
+              <span>←</span>
+              <span>返回機台列表</span>
             </button>
-            <h3 className="font-bold text-slate-900 text-base">{machine.name}</h3>
           </div>
 
           {/* 機台資訊與預約整合卡片 */}
@@ -3011,7 +3011,7 @@
       // 目前頁面標題
       const getTitle = () => {
         if (activeTab === 'machines') {
-          return selectedMachine ? selectedMachine.name : '機台列表';
+          return ''; // 機台列表與機台詳情頁面不顯示重複標題
         }
         if (activeTab === 'reservations') return '我的預約';
         if (activeTab === 'courses') return '課程場次';
@@ -3025,24 +3025,26 @@
             {/* 手機 App Header */}
             <div className="bg-white px-4 py-3 border-b border-slate-200 flex items-center justify-between shadow-2xs relative z-10">
               <div className="flex items-center gap-2.5">
-                <button onClick={logout} className="p-1.5 text-slate-500 hover:text-red-600 rounded-xl hover:bg-slate-100 text-sm transition-colors" title="登出並返回驗證介面">
+                <button onClick={logout} className="p-1.5 text-slate-500 hover:text-red-600 rounded-xl hover:bg-slate-100 text-sm transition-colors cursor-pointer" title="登出並返回驗證介面">
                   🚪
                 </button>
                 <div>
-                  <h2 className="font-bold text-base text-slate-900 leading-tight">
-                    {getTitle()}
-                  </h2>
-                  <span className="text-[10px] text-slate-500 font-semibold block">
-                    👤 {activeUser.name} ({activeUser.mail}) {isAdmin ? '👑 老師/助教' : '🎓 學生'}
+                  {getTitle() ? (
+                    <h2 className="font-bold text-base text-slate-900 leading-tight">
+                      {getTitle()}
+                    </h2>
+                  ) : null}
+                  <span className={`${getTitle() ? 'text-[10px]' : 'text-xs'} text-slate-600 font-semibold block`}>
+                    👤 {activeUser.name} <span className="text-[10px] text-slate-400">({activeUser.mail})</span> {isAdmin ? '👑 老師/助教' : '🎓 學生'}
                   </span>
                 </div>
               </div>
 
               <div className="flex items-center gap-2">
-                <button onClick={refreshData} className="p-1.5 text-slate-600 hover:text-slate-900 text-sm" title="重新整理">🔄</button>
-                {/* NOTE: 詳情頁不顯示全域新增按鈕，改由詳情頁底部按鈕操作 */}
+                <button onClick={refreshData} className="p-1.5 text-slate-600 hover:text-slate-900 text-sm cursor-pointer" title="重新整理">🔄</button>
+                {/* NOTE: 詳情頁不顯示全域新增按鈕，改由詳情頁頂部卡片按鈕操作 */}
                 {!selectedMachine && (
-                  <button onClick={() => openModal()} className="w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md font-bold text-base transition-transform active:scale-95">
+                  <button onClick={() => openModal()} className="w-8 h-8 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md font-bold text-base transition-transform active:scale-95 cursor-pointer">
                     ＋
                   </button>
                 )}
