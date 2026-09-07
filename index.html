@@ -1592,11 +1592,16 @@
       const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
       const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
 
+      // 候選名單：過濾掉登入本人，本人必定直接包含在預約名單中
+      const otherStudents = useMemo(() => {
+        return students.filter(s => s.name !== activeUser?.name && s.mail !== activeUser?.mail);
+      }, [students, activeUser]);
+
       const [selectedMachineId, setSelectedMachineId] = useState(initialMachineId || machines[0]?.id || '帶鋸機');
       const [reservationType, setReservationType] = useState(
         phaseInfo.allowedType === '現場排隊' ? '現場排隊' : '時段預約'
       );
-      const [selectedStudents, setSelectedStudents] = useState([activeUser.name]);
+      const [selectedStudents, setSelectedStudents] = useState([activeUser?.name || '']);
       const [selectedSlotId, setSelectedSlotId] = useState(minutesToTime(courseStartMin));
       const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -1630,9 +1635,14 @@
 
       const toggleStudent = (sName) => {
         if (selectedStudents.includes(sName)) {
-          if (selectedStudents.length === 1) return alert('預約必須至少選一位學生');
+          // 取消勾選組員（本人不在此處取消）
           setSelectedStudents(prev => prev.filter(s => s !== sName));
         } else {
+          // 勾選組員：最多只能勾選 4 人（連同本人共 5 人）
+          if (selectedStudents.length >= 5) {
+            alert('⚠️ 最多只能勾選 4 位組員（連同預約本人共 5 人上限）！');
+            return;
+          }
           setSelectedStudents(prev => [...prev, sName]);
         }
       };
@@ -1640,7 +1650,13 @@
       const handleSubmit = async (e) => {
         e.preventDefault();
         if (!selectedMachineId) return alert('請選擇預約機台！');
-        if (selectedStudents.length === 0) return alert('請至少選擇一位學生！');
+        
+        // 確保本人一定在名單中
+        const finalStudents = selectedStudents.includes(activeUser?.name)
+          ? selectedStudents
+          : [activeUser?.name, ...selectedStudents];
+
+        if (finalStudents.length === 0) return alert('請至少選擇一位學生！');
 
         // 業務防呆驗證 (友善繁體中文提示)
         if (reservationType === '現場排隊') {
@@ -1674,7 +1690,7 @@
           const res = await createReservation({
             machineId: selectedMachineId,
             type: reservationType,
-            students: selectedStudents,
+            students: finalStudents,
             timeSlotId: selectedSlotId,
             // NOTE: 傳入使用者自選的 duration，後端以此為準而非重新計算
             customDuration: selectedDuration
@@ -1768,26 +1784,65 @@
 
               <div>
                 <div className="flex justify-between items-center mb-1.5">
-                  <label className="text-xs font-bold text-slate-700">選擇學生名單 (連動人數時長)：</label>
+                  <label className="text-xs font-bold text-slate-700">選擇共同組員 (連動人數時長)：</label>
                   <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-200">
-                    {selectedStudents.length} 人 ➔ 最多 {maxDuration} 分鐘
+                    {selectedStudents.length} 人（含本人） ➔ 最多 {maxDuration} 分鐘
                   </span>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-50 p-3 rounded-2xl border border-slate-200 text-xs">
-                  {students.map(s => {
-                    const sel = selectedStudents.includes(s.name);
-                    return (
-                      <label key={s.id} className={`flex items-center gap-2 p-2 rounded-xl border cursor-pointer ${sel ? 'bg-blue-50 border-blue-300 text-blue-900 font-bold' : 'bg-white border-slate-200 text-slate-700'}`}>
-                        <input
-                          type="checkbox"
-                          checked={sel}
-                          onChange={() => toggleStudent(s.name)}
-                          className="rounded text-blue-600"
-                        />
-                        <span>{s.name}</span>
-                      </label>
-                    );
-                  })}
+
+                <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200 space-y-2.5">
+                  {/* 預約本人：預設包含，不需手動勾選 */}
+                  <div className="flex items-center justify-between bg-blue-50/70 border border-blue-200/80 px-3 py-2 rounded-xl text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-blue-600 font-bold">👤 預約者（本人）：</span>
+                      <span className="font-bold text-slate-900">{activeUser?.name}</span>
+                      <span className="text-[11px] text-slate-500">({activeUser?.mail})</span>
+                    </div>
+                    <span className="text-[10px] bg-blue-600 text-white font-bold px-2 py-0.5 rounded-full">
+                      必定包含
+                    </span>
+                  </div>
+
+                  {/* 其他可勾選組員（最多勾選 4 人） */}
+                  <div>
+                    <div className="text-[11px] font-semibold text-slate-500 mb-1.5 flex items-center justify-between">
+                      <span>可勾選其他組員（已選 {selectedStudents.length - 1} / 4 人）：</span>
+                      {selectedStudents.length >= 5 && (
+                        <span className="text-amber-600 font-bold text-[10px]">已達 4 位組員上限</span>
+                      )}
+                    </div>
+                    {otherStudents.length > 0 ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                        {otherStudents.map(s => {
+                          const sel = selectedStudents.includes(s.name);
+                          const isMaxReached = !sel && selectedStudents.length >= 5;
+                          return (
+                            <label
+                              key={s.id}
+                              className={`flex items-center gap-2 p-2 rounded-xl border transition-all cursor-pointer ${
+                                sel
+                                  ? 'bg-blue-50 border-blue-400 text-blue-900 font-bold shadow-2xs'
+                                  : isMaxReached
+                                  ? 'bg-slate-100/60 border-slate-200 text-slate-400 cursor-not-allowed'
+                                  : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={sel}
+                                disabled={isMaxReached}
+                                onChange={() => toggleStudent(s.name)}
+                                className="rounded text-blue-600"
+                              />
+                              <span className="truncate">{s.name}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-400 py-1">目前無其他可選擇的組員</p>
+                    )}
+                  </div>
                 </div>
               </div>
 
