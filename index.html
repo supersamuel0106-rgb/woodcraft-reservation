@@ -407,26 +407,26 @@
       });
     }
 
-    // 動態計算現場排隊起始時間（若學生在其他機台有排隊/使用中，自動往後順延避免時間衝突）
+    // 計算現場排隊即時起始時間（推算目前機台最早可接續的時間點）
     function calculateDynamicQueueStart(reservations, machineId, durationMin = 20, courseEndMin = 1020, students = [], userEmail = '') {
       const now = new Date();
       const currentMin = now.getHours() * 60 + now.getMinutes();
       const roundedNow = Math.ceil(currentMin / 10) * 10;
 
-      // 1. 本機台現有有效隊列的最晚結束時間
+      // 1. 本機台目前正在使用或正在等候報到/排隊中的最晚結束時間
       const machineActiveRes = reservations.filter(r => 
         r.machineId === machineId && 
-        (r.status === '排隊中' || r.status === '等待中' || r.status === '等候報到' || r.status === '使用中')
+        (r.status === '使用中' || r.status === '等候報到' || r.status === '等候提前確認' || (r.status === '排隊中' && r.type === '現場排隊'))
       );
       let machineBaseline = roundedNow;
       if (machineActiveRes.length > 0) {
         machineBaseline = Math.max(roundedNow, ...machineActiveRes.map(r => r.endMinutes));
       }
 
-      // 2. 學生在「其他機台」的現有預約/排隊最晚結束時間（若有排其他機台，自動往後順延）
+      // 2. 學生在「其他機台」正在使用或排隊的最晚結束時間（若有排其他機台，需等前一機台結束）
       const studentSet = new Set(students || []);
       const studentActiveRes = reservations.filter(r => {
-        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        if (r.status !== '使用中' && r.status !== '等候報到' && r.status !== '等候提前確認' && !(r.status === '排隊中' && r.type === '現場排隊')) return false;
         const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
         const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
         return isSameEmail || hasCommonStudent;
@@ -436,18 +436,64 @@
         studentBaseline = Math.max(roundedNow, ...studentActiveRes.map(r => r.endMinutes));
       }
 
-      // 初始候選時間：取兩者中較晚者（保證機台空閒 且 同學有空）
-      let cand = Math.max(roundedNow, machineBaseline, studentBaseline);
+      // 即時排隊起始時間：取兩者中較晚者
+      return Math.max(roundedNow, machineBaseline, studentBaseline);
+    }
 
-      while (cand + durationMin <= courseEndMin) {
-        const machineHit = hasReservationConflict(reservations, machineId, cand, durationMin);
-        const studentHit = findStudentConflict(reservations, students, userEmail, cand, durationMin);
-        if (!machineHit && !studentHit) {
-          return cand;
-        }
-        cand += 10;
+    // 檢查預約/排隊是否有衝突
+    function checkReservationConflict(reservations, machineId, startMin, durationMin, students = [], userEmail = '', courseEndMin = 1020, ignoreId = null) {
+      const endMin = startMin + durationMin;
+      const studentSet = new Set(students || []);
+
+      // 1. 超過課程結束時間
+      if (endMin > courseEndMin) {
+        return {
+          hasConflict: true,
+          type: 'EXCEED_COURSE',
+          message: `推算結束時間（${minutesToTime(endMin)}）已超過課程結束時間（${minutesToTime(courseEndMin)}）！`
+        };
       }
-      return cand;
+
+      // 2. 機台時段衝突（檢查該機台是否有後續已預約/排隊時段重疊）
+      const machineHit = reservations.find(r => {
+        if (r.machineId !== machineId) return false;
+        if (r.id === ignoreId) return false;
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        // 排除在起始時間前就已結束的預約
+        if (r.endMinutes <= startMin) return false;
+        return r.startMinutes < endMin && r.endMinutes > startMin;
+      });
+      if (machineHit) {
+        return {
+          hasConflict: true,
+          type: 'MACHINE_CONFLICT',
+          message: `該機台於 ${machineHit.startTimeFormatted} ～ ${machineHit.endTimeFormatted} 已有預約（${(machineHit.students || []).join(', ')}），時段重疊無法預約！`
+        };
+      }
+
+      // 3. 學生跨機台時段衝突
+      const studentHit = reservations.find(r => {
+        if (r.id === ignoreId) return false;
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
+        if (r.endMinutes <= startMin) return false;
+        const hasOverlap = r.startMinutes < endMin && r.endMinutes > startMin;
+        if (!hasOverlap) return false;
+
+        const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+        const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
+        return isSameEmail || hasCommonStudent;
+      });
+      if (studentHit) {
+        const conflictingStudents = (studentHit.students || []).filter(s => studentSet.has(s));
+        const nameStr = conflictingStudents.length > 0 ? conflictingStudents.join(', ') : '名單中的同學';
+        return {
+          hasConflict: true,
+          type: 'STUDENT_CONFLICT',
+          message: `${nameStr} 於 ${studentHit.startTimeFormatted} ～ ${studentHit.endTimeFormatted} 已在【${studentHit.machineName}】有預約，時段重疊不可重複排隊！`
+        };
+      }
+
+      return { hasConflict: false };
     }
 
     function getNextQueueWaiter(reservations, machineId) {
@@ -1001,24 +1047,24 @@
         if (data.type === '時段預約') {
           if (!slotId) return { success: false, message: '請於時段矩陣選擇起始時段' };
           startMin = timeToMinutes(slotId);
-
-          // 限制條件 1：同一機台時段衝突檢查
-          if (hasReservationConflict(reservations, data.machineId, startMin, duration)) {
-            return { success: false, message: `時段衝突：該機台在 ${slotId} ～ ${minutesToTime(startMin + duration)} 已被預約！` };
-          }
-
-          // 限制條件 1：跨機台時段重疊檢查（同學同時間不可預約不同機台）
-          const studentConflict = findStudentConflict(reservations, data.students, activeUser?.mail, startMin, duration);
-          if (studentConflict) {
-            return {
-              success: false,
-              message: `跨機台時段衝突：名單中的同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約/排隊，同時間不可重複預約不同機台！`
-            };
-          }
         } else {
-          // 限制條件 2：現場排隊若有排其他機台，自動往後順延避免時間衝突
+          // 現場排隊推算即時起始時間
           startMin = calculateDynamicQueueStart(reservations, data.machineId, duration, 1020, data.students, activeUser?.mail);
           slotId = null; // 現場排隊不綁定 time_slots 外鍵
+        }
+
+        // 統一呼叫 checkReservationConflict 檢查機台時段衝突與學生跨機台衝突
+        const conflictCheck = checkReservationConflict(
+          reservations,
+          data.machineId,
+          startMin,
+          duration,
+          data.students,
+          activeUser?.mail,
+          1020
+        );
+        if (conflictCheck.hasConflict) {
+          return { success: false, message: conflictCheck.message };
         }
 
         const endMin = startMin + duration;
@@ -1611,9 +1657,9 @@
       // 使用者自選的時長 state，預設為最大值，切換學生人數時同步更新
       const [selectedDuration, setSelectedDuration] = useState(maxDuration);
 
-      // 當學生人數改變時，若已選 duration > 新的最大值，則自動縮短；若 < 最小值則設回最小值
+      // 當學生人數或最大時長改變時，自動連動更新為最新的時長
       useEffect(() => {
-        setSelectedDuration(prev => Math.min(Math.max(prev, MIN_DURATION), maxDuration));
+        setSelectedDuration(maxDuration);
       }, [maxDuration]);
 
       // 切換時段時清除 duration 重設為最大值
@@ -1622,8 +1668,21 @@
         setSelectedDuration(maxDuration);
       };
 
-      // 現場排隊推算：傳入 selectedStudents 與 activeUser.mail，若同學在其他機台有排隊則自動往後順延
+      // 現場排隊推算：傳入 selectedStudents 與 activeUser.mail
       const queueStartMin = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin, selectedStudents, activeUser?.mail);
+      const queueEndMin = queueStartMin + selectedDuration;
+
+      // 即時檢查預約/排隊是否有衝突
+      const targetStartMin = reservationType === '現場排隊' ? queueStartMin : timeToMinutes(selectedSlotId);
+      const conflictInfo = checkReservationConflict(
+        reservations,
+        selectedMachineId,
+        targetStartMin,
+        selectedDuration,
+        selectedStudents,
+        activeUser?.mail,
+        courseEndMin
+      );
 
       const isSlotAllowed = phaseInfo.phase === 'SLOT_ONLY';
       const isQueueAllowed = phaseInfo.phase === 'QUEUE_ONLY' && systemSettings?.allow_walk_in_queue !== false;
@@ -1657,6 +1716,12 @@
           : [activeUser?.name, ...selectedStudents];
 
         if (finalStudents.length === 0) return alert('請至少選擇一位學生！');
+
+        // 衝突防呆檢查
+        if (conflictInfo.hasConflict) {
+          alert(`❌ 無法預約：${conflictInfo.message}`);
+          return;
+        }
 
         // 業務防呆驗證 (友善繁體中文提示)
         if (reservationType === '現場排隊') {
@@ -1847,31 +1912,88 @@
               </div>
 
               {reservationType === '時段預約' ? (
-                <TimeTableMatrix
-                  machineId={selectedMachineId}
-                  minDuration={MIN_DURATION}
-                  maxDuration={maxDuration}
-                  selectedStartSlot={selectedSlotId}
-                  selectedDuration={selectedDuration}
-                  selectedStudents={selectedStudents}
-                  userEmail={activeUser?.mail}
-                  onSelectSlot={handleSelectSlot}
-                  onSelectDuration={setSelectedDuration}
-                />
+                <div className="space-y-2.5">
+                  <TimeTableMatrix
+                    machineId={selectedMachineId}
+                    minDuration={MIN_DURATION}
+                    maxDuration={maxDuration}
+                    selectedStartSlot={selectedSlotId}
+                    selectedDuration={selectedDuration}
+                    selectedStudents={selectedStudents}
+                    userEmail={activeUser?.mail}
+                    onSelectSlot={handleSelectSlot}
+                    onSelectDuration={setSelectedDuration}
+                  />
+                  {conflictInfo.hasConflict && (
+                    <div className="bg-rose-50 border border-rose-300 p-3 rounded-2xl text-xs text-rose-800 font-bold flex items-start gap-2">
+                      <span className="shrink-0 text-base">⚠️</span>
+                      <div>
+                        <div>時段衝突無法預約</div>
+                        <div className="font-normal text-[11px] text-rose-700 mt-0.5">{conflictInfo.message}</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
               ) : (
-                <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl space-y-2 text-xs">
-                  <p className="text-emerald-900 font-bold">現場排隊即時推算：</p>
-                  <p className="text-emerald-800">目前課程進行中，依據機台現有隊列為您推算之預計開始時間為：</p>
-                  <div className="bg-white p-3 rounded-xl border border-emerald-200 font-mono text-sm text-center font-bold text-slate-900">
-                    {minutesToTime(queueStartMin)} ～ {minutesToTime(queueStartMin + selectedDuration)}
+                <div className={`p-4 rounded-2xl border space-y-2 text-xs transition-colors ${
+                  conflictInfo.hasConflict 
+                    ? 'bg-rose-50 border-rose-300 text-rose-900' 
+                    : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                }`}>
+                  <div className="flex items-center justify-between">
+                    <p className="font-bold flex items-center gap-1.5">
+                      <span>{conflictInfo.hasConflict ? '⚠️' : '⏱️'}</span>
+                      <span>現場排隊即時推算：</span>
+                    </p>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                      conflictInfo.hasConflict 
+                        ? 'bg-rose-200 text-rose-800' 
+                        : 'bg-emerald-200 text-emerald-800'
+                    }`}>
+                      {conflictInfo.hasConflict ? '時段衝突無法排隊' : '時段可正常排隊'}
+                    </span>
                   </div>
+
+                  <p className={conflictInfo.hasConflict ? 'text-rose-700 font-medium' : 'text-emerald-800 font-medium'}>
+                    目前課程進行中，依據機台現有隊列與人數（{selectedStudents.length} 人，共 {selectedDuration} 分鐘）為您推算之預計開始時間為：
+                  </p>
+
+                  <div className={`p-3 rounded-xl border font-mono text-base text-center font-extrabold ${
+                    conflictInfo.hasConflict
+                      ? 'bg-white border-rose-300 text-rose-600 line-through'
+                      : 'bg-white border-emerald-200 text-slate-900'
+                  }`}>
+                    {minutesToTime(queueStartMin)} ～ {minutesToTime(queueEndMin)}
+                  </div>
+
+                  {conflictInfo.hasConflict && (
+                    <div className="bg-rose-100/90 border border-rose-300 p-2.5 rounded-xl text-xs text-rose-800 font-bold flex items-start gap-1.5 mt-2">
+                      <span className="shrink-0 text-sm">❌</span>
+                      <span>{conflictInfo.message}</span>
+                    </div>
+                  )}
                 </div>
               )}
 
               <div className="pt-3 border-t border-slate-100 flex justify-end gap-3">
-                <button type="button" onClick={onClose} className="px-4 py-2.5 rounded-xl bg-slate-100 text-slate-700 text-xs font-semibold">取消</button>
-                <button type="submit" disabled={isSubmitting} className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-md shadow-blue-500/20">
-                  {isSubmitting ? '送出中...' : '確認送出申請'}
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmitting || conflictInfo.hasConflict}
+                  className={`px-5 py-2.5 rounded-xl font-bold text-xs shadow-md transition-all ${
+                    conflictInfo.hasConflict
+                      ? 'bg-slate-300 text-slate-500 cursor-not-allowed shadow-none'
+                      : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-500/20 active:scale-95 cursor-pointer'
+                  }`}
+                  title={conflictInfo.hasConflict ? conflictInfo.message : '確認送出申請'}
+                >
+                  {isSubmitting ? '送出中...' : conflictInfo.hasConflict ? '時段衝突無法預約' : '確認送出申請'}
                 </button>
               </div>
             </form>
