@@ -31,7 +31,9 @@ const DEFAULT_STUDENTS: Student[] = [
   { id: '2', name: '王小明', studentNumber: 'S1049793', mail: 'wang.xiaoming@example.com', role: 'student' },
   { id: '3', name: '張偉強', studentNumber: 'S1049794', mail: 'chang.weiqiang@example.com', role: 'student' },
   { id: '4', name: '陳雅婷', studentNumber: 'S1049795', mail: 'chen.yating@example.com', role: 'student' },
-  { id: '5', name: '林志豪', studentNumber: 'S1049796', mail: 'lin.zhihao@example.com', role: 'student' }
+  { id: '5', name: '林志豪', studentNumber: 'S1049796', mail: 'lin.zhihao@example.com', role: 'student' },
+  { id: '6', name: '張卉妮', studentNumber: 'TA02', mail: 'aj115.0827@gmail.com', role: 'ta' },
+  { id: '7', name: '陳品涵', studentNumber: 'TA03', mail: 'chenpinhan062223@gmail.com', role: 'ta' }
 ];
 
 const DEFAULT_SESSIONS: CourseSession[] = [
