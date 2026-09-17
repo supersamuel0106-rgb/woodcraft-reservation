@@ -47,9 +47,27 @@ export const ReservationModal: React.FC<ReservationModalProps> = ({ initialMachi
   const [selectedSlotId, setSelectedSlotId] = useState<string | undefined>(minutesToTime(courseStartMin));
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // 學生人數與使用時長計算
-  const durationMinutes = calculateUsageMinutes(selectedStudents.length);
-  const queueStartMinutes = calculateDynamicQueueStart(reservations, selectedMachineId, durationMinutes, courseEndMin);
+  const MIN_DURATION = 10;
+  const maxDuration = calculateUsageMinutes(selectedStudents.length);
+  const [selectedDuration, setSelectedDuration] = useState<number>(maxDuration);
+
+  useEffect(() => {
+    setSelectedDuration(prev => {
+      if (prev > maxDuration) return maxDuration;
+      if (prev < MIN_DURATION) return MIN_DURATION;
+      return prev;
+    });
+  }, [maxDuration]);
+
+  const durationOptions = React.useMemo(() => {
+    const opts: number[] = [];
+    for (let d = MIN_DURATION; d <= maxDuration; d += 10) {
+      opts.push(d);
+    }
+    return opts;
+  }, [MIN_DURATION, maxDuration]);
+
+  const queueStartMinutes = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin);
 
   // 判斷 Tab 是否受限
   const isSlotAllowed = phaseInfo.phase === 'SLOT_ONLY';
@@ -280,9 +298,14 @@ export const ReservationModal: React.FC<ReservationModalProps> = ({ initialMachi
           {reservationType === '時段預約' ? (
             <TimeTableMatrix
               machineId={selectedMachineId}
-              durationMinutes={durationMinutes}
+              minDuration={MIN_DURATION}
+              maxDuration={maxDuration}
               selectedStartSlot={selectedSlotId}
+              selectedDuration={selectedDuration}
+              selectedStudents={selectedStudents}
+              userEmail={activeUser.mail}
               onSelectSlot={slotId => setSelectedSlotId(slotId)}
+              onSelectDuration={dur => setSelectedDuration(dur)}
             />
           ) : (
             <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl space-y-2 text-xs">
@@ -294,10 +317,34 @@ export const ReservationModal: React.FC<ReservationModalProps> = ({ initialMachi
                 目前課程進行中，依據機台現有隊列為您推算之預計開始時間為：
               </p>
               <div className="bg-white p-3 rounded-xl border border-emerald-200 font-mono text-sm text-center font-bold text-slate-900">
-                {minutesToTime(queueStartMinutes)} ～ {minutesToTime(queueStartMinutes + durationMinutes)}
+                {minutesToTime(queueStartMinutes)} ～ {minutesToTime(queueStartMinutes + selectedDuration)}
                 <span className="text-xs font-normal text-slate-500 block mt-0.5">
                   (當前使用者結束後系統將自動叫號通知)
                 </span>
+              </div>
+
+              {/* 現場排隊時長選擇按鈕組 */}
+              <div className="flex items-center gap-2 flex-wrap pt-1">
+                <span className="font-bold text-slate-700">選擇使用時長：</span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {durationOptions.map(dur => {
+                    const isSelected = selectedDuration === dur;
+                    return (
+                      <button
+                        key={dur}
+                        type="button"
+                        onClick={() => setSelectedDuration(dur)}
+                        className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-blue-600 text-white shadow-xs'
+                            : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 shadow-2xs'
+                        }`}
+                      >
+                        {dur} 分鐘
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
           )}

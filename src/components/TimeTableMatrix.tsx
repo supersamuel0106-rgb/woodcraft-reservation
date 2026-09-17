@@ -13,18 +13,28 @@ import { timeToMinutes, minutesToTime, hasReservationConflict, getEffectiveCours
 
 interface TimeTableMatrixProps {
   machineId: string;
-  durationMinutes: number;
+  minDuration?: number;
+  maxDuration: number;
   selectedStartSlot?: string;
+  selectedDuration: number;
+  selectedStudents?: string[];
+  userEmail?: string;
   onSelectSlot: (slotId: string) => void;
+  onSelectDuration: (duration: number) => void;
 }
 
 const MINUTES_STEP = [0, 10, 20, 30, 40, 50];
 
 export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
   machineId,
-  durationMinutes,
+  minDuration = 10,
+  maxDuration,
   selectedStartSlot,
-  onSelectSlot
+  selectedDuration,
+  selectedStudents = [],
+  userEmail = '',
+  onSelectSlot,
+  onSelectDuration
 }) => {
   const { reservations, systemSettings } = useApp();
 
@@ -43,6 +53,12 @@ export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
   }
 
   const selectedStartMinutes = selectedStartSlot ? timeToMinutes(selectedStartSlot) : null;
+  const effectiveDuration = selectedDuration || minDuration;
+
+  const durationOptions: number[] = [];
+  for (let d = minDuration; d <= maxDuration; d += 10) {
+    durationOptions.push(d);
+  }
 
   // 取得特定時間槽位 (slotMinutes) 之狀態
   const getSlotInfo = (slotMinutes: number) => {
@@ -57,7 +73,7 @@ export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
     if (
       selectedStartMinutes !== null &&
       slotMinutes >= selectedStartMinutes &&
-      slotMinutes < selectedStartMinutes + durationMinutes
+      slotMinutes < selectedStartMinutes + effectiveDuration
     ) {
       return { status: 'selected', symbol: '●', label: timeLabel };
     }
@@ -83,25 +99,61 @@ export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
       return;
     }
 
+    if (selectedStartMinutes !== null) {
+      const clickedOffset = slotMinutes - selectedStartMinutes;
+
+      // 點擊起點本身：在 10 分鐘與 20 分鐘（若上限允許）之間切換
+      if (clickedOffset === 0) {
+        const toggleDur = effectiveDuration > minDuration ? minDuration : (maxDuration >= 20 ? 20 : minDuration);
+        if (toggleDur > minDuration) {
+          if (hasReservationConflict(reservations, machineId, selectedStartMinutes, toggleDur)) {
+            alert(`時段衝突！延長為 ${toggleDur} 分鐘會與該機台已有預約重疊。`);
+            return;
+          }
+        }
+        onSelectDuration(toggleDur);
+        return;
+      }
+
+      if (clickedOffset > 0 && clickedOffset < effectiveDuration) {
+        const newDuration = clickedOffset + 10;
+        if (newDuration >= minDuration) {
+          onSelectDuration(newDuration);
+          return;
+        }
+      } else if (clickedOffset >= effectiveDuration && clickedOffset < maxDuration) {
+        const newDuration = clickedOffset + 10;
+        if (newDuration <= maxDuration) {
+          if (hasReservationConflict(reservations, machineId, selectedStartMinutes, newDuration)) {
+            alert(`時段衝突！延長到此格會與該機台已有預約重疊，請選其他範圍。`);
+            return;
+          }
+          onSelectDuration(newDuration);
+          return;
+        }
+      }
+    }
+
     // 檢查 2：預約時長是否超出課程結束時間
-    if (slotMinutes + durationMinutes > courseEndMin) {
-      alert(
-        `無法預約！\n預約時長 ${durationMinutes} 分鐘將會超過本次課程結束時間 (${minutesToTime(courseEndMin)})！\n請選擇較早的時段。`
-      );
+    if (slotMinutes + minDuration > courseEndMin) {
+      alert(`無法預約！此時段距課程結束不足最少使用時長 ${minDuration} 分鐘（${minutesToTime(courseEndMin)} 結束）。`);
       return;
     }
 
     // 檢查 3：是否與他人預約衝突
-    if (hasReservationConflict(reservations, machineId, slotMinutes, durationMinutes)) {
-      alert(`時段衝突！\n從 ${minutesToTime(slotMinutes)} 開始的 ${durationMinutes} 分鐘已有其他同學預約，請選擇其他時段！`);
+    if (hasReservationConflict(reservations, machineId, slotMinutes, minDuration)) {
+      alert(`時段衝突！\n從 ${minutesToTime(slotMinutes)} 開始的 ${minDuration} 分鐘已有其他同學預約，請選擇其他時段！`);
       return;
     }
 
     onSelectSlot(minutesToTime(slotMinutes));
+    onSelectDuration(effectiveDuration);
   };
 
+  const selectedSlots = effectiveDuration / 10;
+
   return (
-    <div className="space-y-2">
+    <div className="space-y-2.5">
       {/* 標題與圖例 */}
       <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
         <span>
@@ -109,8 +161,44 @@ export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
         </span>
         <div className="flex items-center gap-3 text-[11px]">
           <span className="text-emerald-600 font-bold">○ 可選</span>
-          <span className="text-blue-600 font-bold">● 選定 ({Math.ceil(durationMinutes / 10)}格)</span>
+          <span className="text-blue-600 font-bold">● 選定 ({selectedSlots}格)</span>
           <span className="text-slate-400 font-bold">■ 已占用</span>
+        </div>
+      </div>
+
+      {/* 時長切換按鈕組 */}
+      <div className="flex items-center justify-between gap-2 flex-wrap bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+        <span className="text-xs font-bold text-slate-700">選擇預約時長：</span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {durationOptions.map(dur => {
+            const isSelected = effectiveDuration === dur;
+            return (
+              <button
+                key={dur}
+                type="button"
+                onClick={() => {
+                  if (selectedStartMinutes !== null) {
+                    if (selectedStartMinutes + dur > courseEndMin) {
+                      alert(`時長超過課程結束時間（${minutesToTime(courseEndMin)} 結束）！`);
+                      return;
+                    }
+                    if (hasReservationConflict(reservations, machineId, selectedStartMinutes, dur)) {
+                      alert(`時段衝突！該機台在選定區間（${dur} 分鐘）內已有其他預約。`);
+                      return;
+                    }
+                  }
+                  onSelectDuration(dur);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  isSelected
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 shadow-2xs'
+                }`}
+              >
+                {dur} 分鐘（{dur / 10} 格）
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -173,10 +261,10 @@ export const TimeTableMatrix: React.FC<TimeTableMatrixProps> = ({
         <div className="bg-blue-50 border border-blue-200 text-blue-900 px-3 py-2 rounded-xl text-xs flex items-center justify-between font-medium animate-in fade-in">
           <span>
             已選時段：<strong>{selectedStartSlot}</strong> ～{' '}
-            <strong>{minutesToTime(timeToMinutes(selectedStartSlot) + durationMinutes)}</strong>
+            <strong>{minutesToTime(timeToMinutes(selectedStartSlot) + effectiveDuration)}</strong>
           </span>
           <span className="bg-blue-600 text-white px-2 py-0.5 rounded-full text-[10px] font-bold">
-            共 {durationMinutes} 分鐘
+            共 {effectiveDuration} 分鐘（{selectedSlots} 格）
           </span>
         </div>
       )}

@@ -1430,7 +1430,7 @@
     // ============================================================
     const MINUTES_STEP = [0, 10, 20, 30, 40, 50];
 
-    function TimeTableMatrix({ machineId, minDuration, maxDuration, selectedStartSlot, selectedDuration, selectedStudents, userEmail, onSelectSlot, onSelectDuration }) {
+    function TimeTableMatrix({ machineId, minDuration = 10, maxDuration, selectedStartSlot, selectedDuration, selectedStudents, userEmail, onSelectSlot, onSelectDuration }) {
       const { reservations, systemSettings } = useApp();
       const effectiveTimes = getEffectiveCourseTimes(systemSettings);
       const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
@@ -1446,7 +1446,12 @@
 
       const selectedStartMinutes = selectedStartSlot ? timeToMinutes(selectedStartSlot) : null;
       // 實際被選中的格數（以分鐘計）
-      const effectiveDuration = selectedDuration || maxDuration;
+      const effectiveDuration = selectedDuration || minDuration;
+
+      const durationOptions = [];
+      for (let d = minDuration; d <= maxDuration; d += 10) {
+        durationOptions.push(d);
+      }
 
       const getSlotState = (slotMinutes) => {
         const timeLabel = minutesToTime(slotMinutes);
@@ -1489,12 +1494,27 @@
         if (slotMinutes < courseStartMin || slotMinutes >= courseEndMin) return;
 
         // NOTE: 點擊邏輯——
-        // 若已有起點，且點擊的格在已選範圍「內部」（非起點），則縮短到該格作為終點
-        // 若點擊的格在已選範圍「之後」，且不超過 maxDuration，則延長到該格
-        // 否則（點範圍外）：重新設定起點，duration 重置為 maxDuration
-
+        // 若已有起點：
         if (selectedStartMinutes !== null) {
           const clickedOffset = slotMinutes - selectedStartMinutes; // 點擊格距起點的分鐘數
+
+          // 點擊起點本身：在 10 分鐘與 20 分鐘（若上限允許）之間切換
+          if (clickedOffset === 0) {
+            const toggleDur = effectiveDuration > minDuration ? minDuration : (maxDuration >= 20 ? 20 : minDuration);
+            if (toggleDur > minDuration) {
+              if (hasReservationConflict(reservations, machineId, selectedStartMinutes, toggleDur)) {
+                alert(`時段衝突！延長為 ${toggleDur} 分鐘會與該機台已有預約重疊。`);
+                return;
+              }
+              const studentConflict = findStudentConflict(reservations, selectedStudents, userEmail, selectedStartMinutes, toggleDur);
+              if (studentConflict) {
+                alert(`跨機台衝突！\n同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約！`);
+                return;
+              }
+            }
+            onSelectDuration(toggleDur);
+            return;
+          }
 
           if (clickedOffset > 0 && clickedOffset < effectiveDuration) {
             // 點選已選範圍「內部」：縮短，新 duration = clickedOffset + 10
@@ -1532,8 +1552,8 @@
 
         // 計算可用的最大 duration（不超過課程結束也不超過 maxDuration）
         const maxPossible = Math.min(maxDuration, courseEndMin - slotMinutes);
-        // 對齊為 10 分鐘倍數
         const adjustedMax = Math.floor(maxPossible / 10) * 10;
+        const targetDuration = Math.min(effectiveDuration || maxDuration, adjustedMax);
 
         if (hasReservationConflict(reservations, machineId, slotMinutes, minDuration)) {
           alert(`時段衝突！該機台從 ${minutesToTime(slotMinutes)} 開始的最少時長（${minDuration} 分鐘）已有預約，請換時段！`);
@@ -1547,7 +1567,13 @@
         }
 
         onSelectSlot(minutesToTime(slotMinutes));
-        onSelectDuration(adjustedMax);
+        // 若 targetDuration 無衝突則套用，否則退回 minDuration (10分鐘)
+        if (!hasReservationConflict(reservations, machineId, slotMinutes, targetDuration) && 
+            !findStudentConflict(reservations, selectedStudents, userEmail, slotMinutes, targetDuration)) {
+          onSelectDuration(targetDuration);
+        } else {
+          onSelectDuration(minDuration);
+        }
       };
 
       const selectedSlots = effectiveDuration / 10;
@@ -1555,7 +1581,7 @@
       const minSlots = minDuration / 10;
 
       return (
-        <div className="space-y-2">
+        <div className="space-y-2.5">
           <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
             <span>課程時段矩陣 ({minutesToTime(courseStartMin)} ～ {minutesToTime(courseEndMin)})：</span>
             <div className="flex items-center gap-3 text-[11px]">
@@ -1566,10 +1592,50 @@
             </div>
           </div>
 
-          {/* NOTE: 提示使用者可自由調整格數範圍 */}
+          {/* 時長切換按鈕組：一人可選 10 或 20 分鐘；多人可選 10 ~ maxDuration */}
+          <div className="flex items-center justify-between gap-2 flex-wrap bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+            <span className="text-xs font-bold text-slate-700">選擇預約時長：</span>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {durationOptions.map(dur => {
+                const isSelected = effectiveDuration === dur;
+                return (
+                  <button
+                    key={dur}
+                    type="button"
+                    onClick={() => {
+                      if (selectedStartMinutes !== null) {
+                        if (selectedStartMinutes + dur > courseEndMin) {
+                          alert(`時長超過課程結束時間（${minutesToTime(courseEndMin)} 結束）！`);
+                          return;
+                        }
+                        if (hasReservationConflict(reservations, machineId, selectedStartMinutes, dur)) {
+                          alert(`時段衝突！該機台在選定區間（${dur} 分鐘）內已有其他預約。`);
+                          return;
+                        }
+                        const studentConflict = findStudentConflict(reservations, selectedStudents, userEmail, selectedStartMinutes, dur);
+                        if (studentConflict) {
+                          alert(`跨機台衝突！\n同學在 ${studentConflict.startTimeFormatted} ～ ${studentConflict.endTimeFormatted} 已在【${studentConflict.machineName}】有預約！`);
+                          return;
+                        }
+                      }
+                      onSelectDuration(dur);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                      isSelected
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 shadow-2xs'
+                    }`}
+                  >
+                    {dur} 分鐘（{dur / 10} 格）
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 提示使用者可自由調整格數範圍 */}
           <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-            💡 點選第一格設定起點，再點選範圍內或之後的格子可<strong>縮短或延長</strong>時長。
-            可選 <strong className="text-blue-700">{minSlots} 格（{minDuration} 分鐘）</strong> ～ <strong className="text-blue-700">{maxSlots} 格（{maxDuration} 分鐘）</strong>。
+            💡 點選格子設定時段，可透過上方按鈕或點選格子自由切換 <strong>10 分鐘（1 格）</strong> 或 <strong>20 分鐘（2 格）</strong>。
           </div>
 
           <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-2xs">
@@ -1657,21 +1723,32 @@
       const [selectedSlotId, setSelectedSlotId] = useState(minutesToTime(courseStartMin));
       const [isSubmitting, setIsSubmitting] = useState(false);
 
-      // NOTE: 最少固定 20 分鐘（2格），最多由學生人數決定
-      const MIN_DURATION = 20;
+      // NOTE: 最少 10 分鐘（1格），最多由學生人數決定（1人最多20分鐘，2人最多30分鐘...）
+      const MIN_DURATION = 10;
       const maxDuration = calculateUsageMinutes(selectedStudents.length);
-      // 使用者自選的時長 state，預設為最大值，切換學生人數時同步更新
+      // 使用者自選的時長 state，預設為最大值，切換學生人數時維持合理範圍
       const [selectedDuration, setSelectedDuration] = useState(maxDuration);
 
-      // 當學生人數或最大時長改變時，自動連動更新為最新的時長
+      // 當學生人數改變時，確保 selectedDuration 介於 MIN_DURATION 與 maxDuration 之間
       useEffect(() => {
-        setSelectedDuration(maxDuration);
+        setSelectedDuration(prev => {
+          if (prev > maxDuration) return maxDuration;
+          if (prev < MIN_DURATION) return MIN_DURATION;
+          return prev;
+        });
       }, [maxDuration]);
 
-      // 切換時段時清除 duration 重設為最大值
+      const durationOptions = useMemo(() => {
+        const opts = [];
+        for (let d = MIN_DURATION; d <= maxDuration; d += 10) {
+          opts.push(d);
+        }
+        return opts;
+      }, [MIN_DURATION, maxDuration]);
+
+      // 切換時段時保留使用者自選時長
       const handleSelectSlot = (slotId) => {
         setSelectedSlotId(slotId);
-        setSelectedDuration(maxDuration);
       };
 
       // 現場排隊推算：傳入 selectedStudents 與 activeUser.mail
@@ -1948,6 +2025,30 @@
                       : 'bg-white border-emerald-200 text-slate-900'
                   }`}>
                     {minutesToTime(queueStartMin)} ～ {minutesToTime(queueEndMin)}
+                  </div>
+
+                  {/* 現場排隊時長選擇按鈕組 */}
+                  <div className="flex items-center gap-2 flex-wrap pt-1">
+                    <span className="font-bold text-slate-700">選擇使用時長：</span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {durationOptions.map(dur => {
+                        const isSelected = selectedDuration === dur;
+                        return (
+                          <button
+                            key={dur}
+                            type="button"
+                            onClick={() => setSelectedDuration(dur)}
+                            className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                              isSelected
+                                ? 'bg-blue-600 text-white shadow-xs'
+                                : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 shadow-2xs'
+                            }`}
+                          >
+                            {dur} 分鐘
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   {conflictInfo.hasConflict && (
