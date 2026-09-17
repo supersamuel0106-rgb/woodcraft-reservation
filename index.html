@@ -409,37 +409,49 @@
       });
     }
 
-    // 計算現場排隊即時起始時間（推算目前機台最早可接續的時間點）
+    // 計算現場排隊即時起始時間（推算目前機台最早可接續的時間點，若有任何衝突自動往後推至最早可用時段）
     function calculateDynamicQueueStart(reservations, machineId, durationMin = 20, courseEndMin = 1020, students = [], userEmail = '') {
       const now = new Date();
       const currentMin = now.getHours() * 60 + now.getMinutes();
       const roundedNow = Math.ceil(currentMin / 10) * 10;
-
-      // 1. 本機台目前正在使用或正在等候報到/排隊中的最晚結束時間
-      const machineActiveRes = reservations.filter(r => 
-        r.machineId === machineId && 
-        (r.status === '使用中' || r.status === '等候報到' || r.status === '等候提前確認' || (r.status === '排隊中' && r.type === '現場排隊'))
-      );
-      let machineBaseline = roundedNow;
-      if (machineActiveRes.length > 0) {
-        machineBaseline = Math.max(roundedNow, ...machineActiveRes.map(r => r.endMinutes));
-      }
-
-      // 2. 學生在「其他機台」正在使用或排隊的最晚結束時間（若有排其他機台，需等前一機台結束）
       const studentSet = new Set(students || []);
-      const studentActiveRes = reservations.filter(r => {
-        if (r.status !== '使用中' && r.status !== '等候報到' && r.status !== '等候提前確認' && !(r.status === '排隊中' && r.type === '現場排隊')) return false;
-        const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
-        const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
-        return isSameEmail || hasCommonStudent;
+
+      const activeRes = (reservations || []).filter(r => {
+        if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到' || r.status === '逾時未到') return false;
+        return true;
       });
-      let studentBaseline = roundedNow;
-      if (studentActiveRes.length > 0) {
-        studentBaseline = Math.max(roundedNow, ...studentActiveRes.map(r => r.endMinutes));
+
+      let candStart = roundedNow;
+
+      while (candStart + durationMin <= courseEndMin) {
+        const candEnd = candStart + durationMin;
+
+        // 1. 本機台在 [candStart, candEnd] 內是否有任何重疊預約
+        const machineConflict = activeRes.find(r => 
+          r.machineId === machineId && r.startMinutes < candEnd && r.endMinutes > candStart
+        );
+
+        // 2. 學生在「所有機台」在 [candStart, candEnd] 內是否有任何重疊預約
+        const studentConflict = activeRes.find(r => {
+          const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+          const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
+          return (isSameEmail || hasCommonStudent) && r.startMinutes < candEnd && r.endMinutes > candStart;
+        });
+
+        if (!machineConflict && !studentConflict) {
+          return candStart;
+        }
+
+        // 若有衝突，自動往後推至衝突預約結束時間與當前 candStart+10 較大者
+        const nextPossible = Math.max(
+          machineConflict ? machineConflict.endMinutes : 0,
+          studentConflict ? studentConflict.endMinutes : 0,
+          candStart + 10
+        );
+        candStart = Math.ceil(nextPossible / 10) * 10;
       }
 
-      // 即時排隊起始時間：取兩者中較晚者
-      return Math.max(roundedNow, machineBaseline, studentBaseline);
+      return candStart;
     }
 
     // 檢查預約/排隊是否有衝突
@@ -1041,6 +1053,9 @@
           }
         }
 
+        const effectiveTimes = getEffectiveCourseTimes(systemSettings);
+        const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
+
         // NOTE: 若使用者自選了時長（customDuration），以自選值為準；否則退回自動計算
         const duration = data.customDuration || calculateUsageMinutes(data.students.length);
         let startMin = 540;
@@ -1050,8 +1065,8 @@
           if (!slotId) return { success: false, message: '請於時段矩陣選擇起始時段' };
           startMin = timeToMinutes(slotId);
         } else {
-          // 現場排隊推算即時起始時間
-          startMin = calculateDynamicQueueStart(reservations, data.machineId, duration, 1020, data.students, activeUser?.mail);
+          // 現場排隊推算即時起始時間（自動往後推至無衝突的最早可用時段）
+          startMin = calculateDynamicQueueStart(reservations, data.machineId, duration, courseEndMin, data.students, activeUser?.mail);
           slotId = null; // 現場排隊不綁定 time_slots 外鍵
         }
 
@@ -1063,7 +1078,7 @@
           duration,
           data.students,
           activeUser?.mail,
-          1020
+          courseEndMin
         );
         if (conflictCheck.hasConflict) {
           return { success: false, message: conflictCheck.message };
@@ -2026,6 +2041,14 @@
                   }`}>
                     {minutesToTime(queueStartMin)} ～ {minutesToTime(queueEndMin)}
                   </div>
+
+                  {/* 若時間因前方預約或忙碌而往後推，顯示友善提示 */}
+                  {queueStartMin > Math.ceil((new Date().getHours() * 60 + new Date().getMinutes()) / 10) * 10 && !conflictInfo.hasConflict && (
+                    <div className="bg-emerald-100/80 border border-emerald-300/80 px-3 py-2 rounded-xl text-[11px] text-emerald-900 flex items-start gap-1.5">
+                      <span className="shrink-0 text-xs">💡</span>
+                      <span>已自動為您避開其他機台預約與前方隊列，排至<strong>最早可用時段（{minutesToTime(queueStartMin)} ～ {minutesToTime(queueEndMin)}）</strong>。</span>
+                    </div>
+                  )}
 
                   {/* 現場排隊時長選擇按鈕組 */}
                   <div className="flex items-center gap-2 flex-wrap pt-1">

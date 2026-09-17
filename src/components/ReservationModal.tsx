@@ -67,7 +67,7 @@ export const ReservationModal: React.FC<ReservationModalProps> = ({ initialMachi
     return opts;
   }, [MIN_DURATION, maxDuration]);
 
-  const queueStartMinutes = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin);
+  const queueStartMinutes = calculateDynamicQueueStart(reservations, selectedMachineId, selectedDuration, courseEndMin, selectedStudents, activeUser.mail);
 
   // 判斷 Tab 是否受限
   const isSlotAllowed = phaseInfo.phase === 'SLOT_ONLY';

@@ -208,33 +208,51 @@ export function calculateDynamicQueueStart(
   reservations: Reservation[],
   machineId: string,
   durationMinutes: number = 20,
-  courseEndMinutes: number = 1020 // 預設 17:00
+  courseEndMinutes: number = 1020, // 預設 17:00
+  students: string[] = [],
+  userEmail: string = ''
 ): number {
   const now = new Date();
   const currentMinutes = now.getHours() * 60 + now.getMinutes();
   const roundedNow = Math.ceil(currentMinutes / 10) * 10;
+  const studentSet = new Set(students || []);
 
-  const activeReservations = reservations.filter(r => 
-    r.machineId === machineId && 
-    (r.status === '排隊中' || r.status === '等待中' || r.status === '等候報到' || r.status === '使用中')
-  );
+  const activeRes = (reservations || []).filter(r => {
+    if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到' || r.status === '逾時未到') return false;
+    return true;
+  });
 
-  let baselineStart = roundedNow;
-  if (activeReservations.length > 0) {
-    const maxEnd = Math.max(...activeReservations.map(r => r.endMinutes));
-    baselineStart = Math.max(roundedNow, maxEnd);
-  }
+  let candStart = roundedNow;
 
-  let candidateStart = baselineStart;
-  while (candidateStart + durationMinutes <= courseEndMinutes) {
-    const conflict = hasReservationConflict(reservations, machineId, candidateStart, durationMinutes);
-    if (!conflict) {
-      return candidateStart;
+  while (candStart + durationMinutes <= courseEndMinutes) {
+    const candEnd = candStart + durationMinutes;
+
+    // 1. 本機台在 [candStart, candEnd] 內是否有任何重疊預約
+    const machineConflict = activeRes.find(r => 
+      r.machineId === machineId && r.startMinutes < candEnd && r.endMinutes > candStart
+    );
+
+    // 2. 學生在「所有機台」在 [candStart, candEnd] 內是否有任何重疊預約
+    const studentConflict = activeRes.find(r => {
+      const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+      const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
+      return (isSameEmail || hasCommonStudent) && r.startMinutes < candEnd && r.endMinutes > candStart;
+    });
+
+    if (!machineConflict && !studentConflict) {
+      return candStart;
     }
-    candidateStart += 10;
+
+    // 若有衝突，自動往後推至衝突預約結束時間與當前 candStart+10 較大者
+    const nextPossible = Math.max(
+      machineConflict ? machineConflict.endMinutes : 0,
+      studentConflict ? studentConflict.endMinutes : 0,
+      candStart + 10
+    );
+    candStart = Math.ceil(nextPossible / 10) * 10;
   }
 
-  return baselineStart;
+  return candStart;
 }
 
 /**

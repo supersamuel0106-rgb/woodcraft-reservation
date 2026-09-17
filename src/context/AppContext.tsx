@@ -252,7 +252,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
     } else {
-      startMin = calculateDynamicQueueStart(reservations, data.machineId, duration);
+      const effectiveTimes = getEffectiveCourseTimes(systemSettings);
+      const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
+      startMin = calculateDynamicQueueStart(reservations, data.machineId, duration, courseEndMin, data.students, activeUser.mail);
       slotId = undefined;
     }
 
