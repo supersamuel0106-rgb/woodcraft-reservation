@@ -546,7 +546,14 @@
             supabaseClient.from('system_settings').select('*').eq('id', 'DEFAULT').single()
           ]);
 
-          const rawMachines = (mRes.data || []).map(row => ({ id: row.id, name: row.name, status: row.status }));
+          // NOTE: 機台 id 格式為「N. 名稱」，以字串排序會導致 10 排在 2 前面，改用數字排序
+          const rawMachines = (mRes.data || [])
+            .map(row => ({ id: row.id, name: row.name, status: row.status }))
+            .sort((a, b) => {
+              const numA = parseInt(a.id) || 0;
+              const numB = parseInt(b.id) || 0;
+              return numA - numB;
+            });
           const rawReservations = (rRes.data || []).map(row => ({
             id: row.id,
             machineId: row.machine_id,

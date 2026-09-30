@@ -20,10 +20,20 @@ const STORAGE_KEYS = {
 };
 
 const DEFAULT_MACHINES: Machine[] = [
-  { id: '帶鋸機', name: '帶鋸機', status: '空閒' },
-  { id: '推台鋸', name: '推台鋸', status: '空閒' },
-  { id: '圓鋸機', name: '圓鋸機', status: '空閒' },
-  { id: '自動刨木機', name: '自動刨木機', status: '空閒' }
+  { id: '1. 角切機（makita）',        name: '1. 角切機（makita）',        status: '空閒' },
+  { id: '2. 角切機（Bosch）',         name: '2. 角切機（Bosch）',         status: '空閒' },
+  { id: '3. 手壓鉋（外）',            name: '3. 手壓鉋（外）',            status: '空閒' },
+  { id: '4. 手壓鉋（內）',            name: '4. 手壓鉋（內）',            status: '空閒' },
+  { id: '5. 自動鉋（外）',            name: '5. 自動鉋（外）',            status: '空閒' },
+  { id: '6. 自動鉋（內）',            name: '6. 自動鉋（內）',            status: '空閒' },
+  { id: '7. 圓鋸機',                  name: '7. 圓鋸機',                  status: '空閒' },
+  { id: '8. 推台鋸',                  name: '8. 推台鋸',                  status: '空閒' },
+  { id: '9. 水平鑽床',                name: '9. 水平鑽床',                status: '空閒' },
+  { id: '10. 垂直鑽床（有保護罩）',  name: '10. 垂直鑽床（有保護罩）',  status: '空閒' },
+  { id: '11. 垂直鑽床（無保護罩）',  name: '11. 垂直鑽床（無保護罩）',  status: '空閒' },
+  { id: '12. 臥式花鉋機',             name: '12. 臥式花鉋機',             status: '空閒' },
+  { id: '13. 帶鋸機',                 name: '13. 帶鋸機',                 status: '空閒' },
+  { id: '14. 落地式線鋸機',           name: '14. 落地式線鋸機',           status: '空閒' },
 ];
 
 const DEFAULT_STUDENTS: Student[] = [
