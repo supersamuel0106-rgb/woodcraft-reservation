@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>木工機台預約排隊系統 - 學生操作指引手冊</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eff6ff',
+              500: '#3b82f6',
+              600: '#2563eb',
+              700: '#1d4ed8',
+              900: '#1e3a8a',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap');
+    body {
+      font-family: 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* 紅色醒目標記外框動畫與效果 */
+    .red-target-box {
+      border: 3px solid #ef4444;
+      border-radius: 14px;
+      box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.25), 0 4px 12px rgba(239, 68, 68, 0.3);
+      position: relative;
+      animation: pulse-border 2.5s infinite;
+    }
+
+    .red-target-badge {
+      position: absolute;
+      background: #ef4444;
+      color: white;
+      font-weight: 900;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      z-index: 30;
+      white-space: nowrap;
+    }
+
+    @keyframes pulse-border {
+      0%, 100% {
+        border-color: #ef4444;
+        box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.25), 0 4px 12px rgba(239, 68, 68, 0.3);
+      }
+      50% {
+        border-color: #dc2626;
+        box-shadow: 0 0 0 5px rgba(220, 38, 38, 0.4), 0 6px 16px rgba(220, 38, 38, 0.45);
+      }
+    }
+
+    /* 列印與 PDF 樣式優化 */
+    @media print {
+      body {
+        background-color: white !important;
+        color: black !important;
+      }
+      .no-print {
+        display: none !important;
+      }
+      .page-break {
+        page-break-before: always;
+        break-before: page;
+      }
+      .step-card {
+        page-break-inside: avoid;
+        break-inside: avoid;
+        margin-bottom: 24px !important;
+        box-shadow: none !important;
+        border: 1px solid #cbd5e1 !important;
+      }
+      .red-target-box {
+        animation: none !important;
+        box-shadow: none !important;
+      }
+    }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen antialiased selection:bg-red-500 selection:text-white">
+
+  <!-- 頂部導航列 (列印時隱藏) -->
+  <header class="no-print sticky top-0 z-50 bg-slate-900/90 backdrop-blur-md border-b border-slate-800">
+    <div class="max-w-6xl mx-auto px-4 py-3.5 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="text-2xl p-2 bg-blue-600/20 text-blue-400 rounded-xl border border-blue-500/30">🪚</span>
+        <div>
+          <h1 class="text-base sm:text-lg font-black text-white flex items-center gap-2">
+            木工機台預約排隊系統
+            <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">學生操作手冊</span>
+          </h1>
+          <p class="text-[11px] text-slate-400 hidden sm:block">完整操作指南：從登入、預約、排隊到開始使用與結束</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 sm:gap-3">
+        <button onclick="window.print()" class="px-3 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl transition flex items-center gap-1.5 shadow-sm">
+          <span>🖨️</span>
+          <span>列印 / 存為 PDF</span>
+        </button>
+        <a href="index.html" class="px-3.5 py-1.5 text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white rounded-xl transition flex items-center gap-1.5 shadow-md shadow-blue-600/20">
+          <span>📱</span>
+          <span>開啟系統 App</span>
+        </a>
+      </div>
+    </div>
+
+    <!-- 步驟快速跳轉列 -->
+    <div class="bg-slate-950/80 border-t border-slate-800/80 overflow-x-auto py-2 px-4">
+      <div class="max-w-6xl mx-auto flex items-center gap-2 text-xs whitespace-nowrap">
+        <span class="text-slate-400 font-bold shrink-0 text-[11px]">快速跳轉：</span>
+        <a href="#step-1" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 1: 登入確認</a>
+        <a href="#step-2" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 2: 機台總覽</a>
+        <a href="#step-3" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 3: 時段預約</a>
+        <a href="#step-4" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 4: 現場排隊</a>
+        <a href="#step-5" class="px-2.5 py-1 rounded-lg bg-red-500/20 border border-red-500/40 text-red-300 font-bold hover:bg-red-500/30 transition">步驟 5: 報到開始 (必看!)</a>
+        <a href="#step-6" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 6: 結束使用</a>
+        <a href="#step-7" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-red-600/20 hover:text-red-400 text-slate-300 transition">步驟 7: 我的預約</a>
+        <a href="#faq" class="px-2.5 py-1 rounded-lg bg-slate-800/60 hover:bg-blue-600/20 hover:text-blue-400 text-slate-300 transition">常見問題 FAQ</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- 內容容器 -->
+  <main class="max-w-6xl mx-auto px-4 py-8 space-y-12">
+
+    <!-- 歡迎與手冊簡介 Banner -->
+    <section class="bg-gradient-to-r from-blue-900/60 via-slate-800/80 to-slate-900 border border-blue-500/30 rounded-3xl p-6 sm:p-8 shadow-2xl relative overflow-hidden">
+      <div class="relative z-10 max-w-3xl space-y-3">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/20 border border-blue-400/30 text-blue-300 text-xs font-bold">
+          <span>🎓</span>
+          <span>木工工場修課同學必讀手冊</span>
+        </div>
+        <h2 class="text-2xl sm:text-3xl font-black text-white tracking-tight">
+          輕鬆掌握機台預約與排隊，不再耗時空等
+        </h2>
+        <p class="text-slate-300 text-sm sm:text-base leading-relaxed">
+          本手冊專門為修課同學設計，提供清晰的手機操作指引。包含「<strong class="text-white">課前 24 小時時段預約</strong>」與「<strong class="text-white">課堂中現場排隊</strong>」雙軌機制，並說明最重要的<strong class="text-red-400">叫號報到</strong>與<strong class="text-amber-400">逾時順延</strong>規則。
+        </p>
+        <!-- 重點規則提示標籤 -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs">
+          <div class="bg-slate-900/80 border border-slate-700/80 p-3 rounded-2xl">
+            <span class="text-blue-400 font-bold block mb-1">⏱️ 預約時限規則</span>
+            <span class="text-slate-400">1人可選 10 或 20 分；每多 1 人 +10 分鐘，最多 5 人 60 分鐘。</span>
+          </div>
+          <div class="bg-slate-900/80 border border-slate-700/80 p-3 rounded-2xl">
+            <span class="text-emerald-400 font-bold block mb-1">👥 組員勾選上限</span>
+            <span class="text-slate-400">本人固定在名單第 1 位，最多另勾選 4 位組員（共 5 人）。</span>
+          </div>
+          <div class="bg-slate-900/80 border border-red-500/40 p-3 rounded-2xl">
+            <span class="text-red-400 font-bold block mb-1">⚠️ 逾時不取消、改順延</span>
+            <span class="text-slate-400">逾時未報到不直接取消！若後面有人排隊則後面先用，您往後順延。</span>
+          </div>
+        </div>
+      </div>
+      <div class="absolute -right-8 -bottom-8 opacity-10 text-[180px] pointer-events-none select-none">
+        🪚
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 01：登入與身分確認 -->
+    <!-- ========================================================================= -->
+    <section id="step-1" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">1</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟一：快速登入與身份確認</h3>
+          <p class="text-xs text-slate-400">免繁瑣註冊，系統已預載 27 位修課學生名冊，選擇自己名字即可登入</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 + 紅框標示 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-white text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-4 overflow-hidden relative">
+            <!-- 狀態列 -->
+            <div class="flex justify-between items-center text-[10px] text-slate-400 mb-3 px-1">
+              <span>09:41</span>
+              <span>📶 5G 🔋 100%</span>
+            </div>
+
+            <!-- 標題區域 -->
+            <div class="text-center py-2 space-y-1">
+              <span class="text-2xl">🪵</span>
+              <h4 class="font-extrabold text-sm text-slate-800">木工機台預約系統</h4>
+              <p class="text-[10px] text-slate-500">國立高雄師範大學 • 工業設計學系</p>
+            </div>
+
+            <!-- 表單內容與紅框標記 -->
+            <div class="space-y-4 my-4">
+              <!-- ❶ 紅框標記：學生身分選單 -->
+              <div class="relative red-target-box p-2 bg-slate-50">
+                <span class="red-target-badge -top-3.5 left-2">❶ 點此選擇您的姓名</span>
+                <label class="block text-[10px] font-bold text-slate-600 mb-1">修課學生姓名選單：</label>
+                <div class="w-full p-2 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-800 flex justify-between items-center shadow-xs">
+                  <span>黃聖閎 (41120001)</span>
+                  <span class="text-slate-400 text-[10px]">▼</span>
+                </div>
+              </div>
+
+              <!-- ❷ 紅框標記：確認登入按鈕 -->
+              <div class="relative red-target-box p-1 bg-white">
+                <span class="red-target-badge -top-3 left-2">❷ 點擊確認登入</span>
+                <button class="w-full py-2.5 bg-blue-600 text-white rounded-xl text-xs font-black shadow-md flex items-center justify-center gap-1">
+                  <span>進入機台預約系統</span>
+                  <span>➔</span>
+                </button>
+              </div>
+
+              <!-- ❸ 紅框標記：登入後個人身分顯示 -->
+              <div class="relative red-target-box p-2 bg-blue-50 border-blue-200">
+                <span class="red-target-badge -top-3.5 left-2">❸ 登入後核對頂部身分</span>
+                <div class="flex items-center gap-1.5 text-[11px] font-bold text-slate-800">
+                  <span>👤 黃聖閎</span>
+                  <span class="px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 text-[9px]">🎓 學生</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="text-[9px] text-center text-slate-400 mt-2">
+              若在名單中找不到姓名，請直接洽詢現場助教協助建立帳號。
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              選擇姓名
+            </h5>
+            <p>點開下拉選單，從 27 位修課名單中找到您的名字。系統會自動載入您的學號與已登記信箱。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              點擊確認登入
+            </h5>
+            <p>點擊「進入機台預約系統」按鈕，立即進入機台首頁，系統會自動保持登入狀態，下次打開無須重複輸入。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❸</span>
+              核對身分與權限
+            </h5>
+            <p>登入成功後，請確認頂部顯示「👤 您的名字」及「🎓 學生」標籤。您擁有瀏覽 14 台機台、時段預約、現場排隊及查看個人預約之完整權限。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 02：機台列表與狀態識別 -->
+    <!-- ========================================================================= -->
+    <section id="step-2" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">2</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟二：瀏覽機台狀態與選擇機台</h3>
+          <p class="text-xs text-slate-400">工場共 14 台正式機台，嚴格按編號 1～14 排序，燈號即時反應目前狀況</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-slate-100 text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <!-- App Header -->
+            <div class="bg-white p-2.5 rounded-2xl shadow-xs flex justify-between items-center mb-3">
+              <span class="text-xs font-black text-slate-900">🪚 機台列表</span>
+              <span class="text-[10px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full font-bold">14 台設備</span>
+            </div>
+
+            <!-- 機台卡片列表 -->
+            <div class="space-y-2.5">
+              <!-- ❶ 紅框標記：機台狀態燈號 -->
+              <div class="relative red-target-box p-2.5 bg-white rounded-xl shadow-xs">
+                <span class="red-target-badge -top-3.5 left-2">❶ 識別機台狀態燈號</span>
+                <div class="flex justify-between items-start mb-1">
+                  <span class="text-xs font-black text-slate-900">1. 角切機（makita）</span>
+                  <span class="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">● 空閒中</span>
+                </div>
+                <div class="text-[10px] text-slate-500 flex justify-between">
+                  <span>目前等候：0 組</span>
+                  <span class="text-blue-600 font-bold">點擊預約 ➔</span>
+                </div>
+              </div>
+
+              <!-- ❷ 紅框標記：點擊卡片進入 -->
+              <div class="relative red-target-box p-2.5 bg-white rounded-xl shadow-xs">
+                <span class="red-target-badge -top-3.5 left-2">❷ 點選欲使用的機台</span>
+                <div class="flex justify-between items-start mb-1">
+                  <span class="text-xs font-black text-slate-900">13. 帶鋸機</span>
+                  <span class="text-[10px] font-black px-2 py-0.5 rounded-full bg-rose-100 text-rose-800">● 使用中</span>
+                </div>
+                <div class="text-[10px] text-slate-500 flex justify-between">
+                  <span>李同學（至 10:40）</span>
+                  <span class="text-slate-600">等候：2 組</span>
+                </div>
+              </div>
+
+              <!-- 機台 3 (等待報到) -->
+              <div class="p-2.5 bg-white rounded-xl shadow-xs border border-slate-200">
+                <div class="flex justify-between items-start mb-1">
+                  <span class="text-xs font-black text-slate-900">8. 推台鋸</span>
+                  <span class="text-[10px] font-black px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">● 等待報到</span>
+                </div>
+                <div class="text-[10px] text-slate-500">
+                  已叫號王同學（報到倒數 2:15）
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              三種機台即時狀態說明
+            </h5>
+            <div class="space-y-1.5 text-xs text-slate-300">
+              <p><span class="inline-block w-3 h-3 rounded-full bg-emerald-500 mr-1.5"></span><strong class="text-emerald-400">【空閒】</strong>：機台目前無人使用，若現場排隊可立即報到使用！</p>
+              <p><span class="inline-block w-3 h-3 rounded-full bg-amber-500 mr-1.5"></span><strong class="text-amber-400">【等待報到】</strong>：已叫號或時段開始，正在等候該位同學於 3 分鐘內報到。</p>
+              <p><span class="inline-block w-3 h-3 rounded-full bg-rose-500 mr-1.5"></span><strong class="text-rose-400">【使用中】</strong>：同學正操作機台中，畫面上會顯示剩餘時間與預計結束時段。</p>
+            </div>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              點選機台進入詳情頁
+            </h5>
+            <p>點擊任何一台機台卡片，即可展開「機台詳情頁面」，進一步查看完整預約時間軸、當前隊列名單，並點擊按鈕開啟「新增預約」彈窗。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 03：時段預約 (課前 24 小時開放) -->
+    <!-- ========================================================================= -->
+    <section id="step-3" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">3</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟三：時段預約（開課前 24 小時開放）</h3>
+          <p class="text-xs text-slate-400">上課前提前規劃時程，勾選組員可延長使用時間，最高 5 人 60 分鐘</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-white text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <div class="border-b border-slate-200 pb-2 mb-2 flex justify-between items-center">
+              <span class="text-xs font-black text-slate-900">新增預約 - 帶鋸機</span>
+              <span class="text-slate-400 text-xs">✕</span>
+            </div>
+
+            <div class="space-y-3">
+              <!-- ❶ 紅框標記：模式切換為時段預約 -->
+              <div class="relative red-target-box p-1 bg-slate-100 rounded-xl flex gap-1">
+                <span class="red-target-badge -top-3.5 left-2">❶ 選擇「時段預約」</span>
+                <div class="flex-1 py-1 text-center bg-white rounded-lg text-[11px] font-bold text-blue-600 shadow-xs">
+                  時段預約
+                </div>
+                <div class="flex-1 py-1 text-center text-[11px] font-bold text-slate-500">
+                  現場排隊
+                </div>
+              </div>
+
+              <!-- ❷ 紅框標記：組員勾選 (最多4人) -->
+              <div class="relative red-target-box p-2 bg-slate-50 rounded-xl space-y-1.5">
+                <span class="red-target-badge -top-3.5 left-2">❷ 勾選組員（本人固定首位）</span>
+                <div class="bg-blue-50 border border-blue-200 px-2 py-1 rounded text-[10px] font-bold text-blue-900">
+                  👤 預約者（本人）：黃聖閎
+                </div>
+                <div class="text-[9px] text-slate-500 font-bold">可勾選其他組員（已選 1 / 4 人）：</div>
+                <div class="grid grid-cols-2 gap-1 text-[10px]">
+                  <label class="p-1 bg-blue-100 border border-blue-400 rounded text-blue-900 font-bold flex items-center gap-1">
+                    <input type="checkbox" checked class="scale-75"> 許華萱
+                  </label>
+                  <label class="p-1 bg-white border border-slate-200 rounded text-slate-700 flex items-center gap-1">
+                    <input type="checkbox" class="scale-75"> 王姝伃
+                  </label>
+                </div>
+              </div>
+
+              <!-- ❸ 紅框標記：時長選擇 -->
+              <div class="relative red-target-box p-2 bg-slate-50 rounded-xl">
+                <span class="red-target-badge -top-3.5 left-2">❸ 選擇時長（2人上限30分）</span>
+                <div class="text-[10px] text-slate-600 font-bold mb-1">使用時長選擇：</div>
+                <div class="flex gap-1">
+                  <span class="px-2 py-1 bg-white border border-slate-300 rounded text-[10px] font-bold text-slate-600">10 分</span>
+                  <span class="px-2 py-1 bg-white border border-slate-300 rounded text-[10px] font-bold text-slate-600">20 分</span>
+                  <span class="px-2 py-1 bg-blue-600 text-white rounded text-[10px] font-bold shadow-xs">30 分 (上限)</span>
+                </div>
+              </div>
+
+              <!-- ❹ 紅框標記：時段方塊點選與送出 -->
+              <div class="relative red-target-box p-2 bg-slate-50 rounded-xl">
+                <span class="red-target-badge -top-3.5 left-2">❹ 點選時段並確認送出</span>
+                <div class="grid grid-cols-4 gap-1 text-[9px] text-center mb-2">
+                  <span class="p-1 bg-slate-200 text-slate-400 rounded line-through">09:00</span>
+                  <span class="p-1 bg-slate-200 text-slate-400 rounded line-through">09:30</span>
+                  <span class="p-1 bg-emerald-500 text-white rounded font-bold ring-2 ring-emerald-600">10:00 ✔</span>
+                  <span class="p-1 bg-emerald-100 text-emerald-800 rounded font-bold">10:30</span>
+                </div>
+                <button class="w-full py-1.5 bg-blue-600 text-white rounded-lg text-xs font-black shadow-md">
+                  確認送出預約
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              時段預約開放時間
+            </h5>
+            <p>每堂課開課前 <strong class="text-blue-400">24 小時</strong>開放登記時段。上課開始（如早上 09:00）後時段預約即截止，全面轉為「現場排隊」。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              組員勾選與人數限制
+            </h5>
+            <p>
+              • 預約者本人固定在名單第 1 位（不可取消）。<br>
+              • 最多只能另外勾選 <strong class="text-emerald-400">4 位同學</strong>（連同本人共 5 人上限）。<br>
+              • 系統會自動發送通知與 Email 給所有被勾選的組員！
+            </p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❸</span>
+              時長計算與彈性選擇
+            </h5>
+            <p>
+              • <strong>1 人</strong>：可選 10 或 20 分鐘。<br>
+              • <strong>2 人</strong>：上限 30 分鐘（可自選 10、20 或 30 分鐘）。<br>
+              • 每多 1 人 +10 分鐘，<strong>5 人上限為 60 分鐘</strong>。
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 04：現場排隊 (課堂進行中) -->
+    <!-- ========================================================================= -->
+    <section id="step-4" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">4</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟四：現場排隊（課堂進行中）</h3>
+          <p class="text-xs text-slate-400">上課時段隨到隨排，系統自動避開既有時段與跨機台衝突，即時推算開始時間</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-white text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <div class="border-b border-slate-200 pb-2 mb-2 flex justify-between items-center">
+              <span class="text-xs font-black text-slate-900">現場排隊 - 圓鋸機</span>
+              <span class="text-slate-400 text-xs">✕</span>
+            </div>
+
+            <div class="space-y-3">
+              <!-- ❶ 紅框標記：切換為現場排隊 -->
+              <div class="relative red-target-box p-1 bg-slate-100 rounded-xl flex gap-1">
+                <span class="red-target-badge -top-3.5 left-2">❶ 選擇「現場排隊」</span>
+                <div class="flex-1 py-1 text-center text-[11px] font-bold text-slate-500">
+                  時段預約
+                </div>
+                <div class="flex-1 py-1 text-center bg-white rounded-lg text-[11px] font-bold text-blue-600 shadow-xs">
+                  現場排隊
+                </div>
+              </div>
+
+              <!-- ❷ 紅框標記：即時推算時段 -->
+              <div class="relative red-target-box p-3 bg-emerald-50 border-emerald-300 rounded-2xl">
+                <span class="red-target-badge -top-3.5 left-2">❷ 查看系統即時推算時間</span>
+                <div class="flex justify-between items-center text-[11px] font-bold text-emerald-900 mb-1">
+                  <span>⏱️ 預計開始時段：</span>
+                  <span class="px-2 py-0.5 rounded-full bg-emerald-200 text-emerald-800 text-[9px]">可正常排隊</span>
+                </div>
+                <div class="p-2 bg-white rounded-xl border border-emerald-200 text-center font-mono font-black text-base text-slate-900 shadow-inner">
+                  10:40 ～ 11:00
+                </div>
+                <div class="text-[9px] text-emerald-700 mt-1">
+                  已自動為您避開前方使用中與等候隊列
+                </div>
+              </div>
+
+              <!-- ❸ 紅框標記：送出排隊按鈕 -->
+              <div class="relative red-target-box p-1 bg-white">
+                <span class="red-target-badge -top-3 left-2">❸ 點擊加入現場排隊</span>
+                <button class="w-full py-2.5 bg-emerald-600 text-white rounded-xl text-xs font-black shadow-md flex items-center justify-center gap-1">
+                  <span>立即加入排隊（1 人 20 分鐘）</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              隨時加入隊列
+            </h5>
+            <p>只要在課程進行中，機台即使有人使用，您也能隨時按下「現場排隊」加入候補隊列。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              智慧衝突防呆
+            </h5>
+            <p>
+              若您或被勾選的組員在該時段剛好在「其他機台」有預約或排隊，系統會提示衝堂，並自動將時間順延到空檔，絕不重疊！
+            </p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❸</span>
+              即時推進叫號
+            </h5>
+            <p>
+              若機台當前正好無人使用，新增排隊後系統會<strong class="text-emerald-400">立刻為您叫號</strong>，直接進入 3 分鐘報到倒數！
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 05：收到叫號通知與報到開始 (關鍵防呆重點！) -->
+    <!-- ========================================================================= -->
+    <section id="step-5" class="step-card bg-slate-800/60 border-2 border-red-500/80 rounded-3xl p-6 sm:p-8 space-y-6 shadow-2xl relative">
+      <div class="flex items-center justify-between border-b border-red-500/40 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/50">5</span>
+          <div>
+            <h3 class="text-xl font-black text-white flex items-center gap-2">
+              步驟五：叫號通知與報到開始使用
+              <span class="px-2 py-0.5 rounded-full bg-red-500 text-white text-[10px] font-black">重要核心</span>
+            </h3>
+            <p class="text-xs text-red-300">輪到您時請在 3 分鐘內至機台前報到，注意預約與排隊的開始時間限制！</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-slate-100 text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <!-- 頂部叫號橫幅 -->
+            <div class="bg-amber-500 text-slate-950 p-2.5 rounded-2xl mb-3 shadow-md flex items-center justify-between">
+              <div class="text-[11px] font-black flex items-center gap-1.5">
+                <span>🔔</span>
+                <span>已輪到您！請盡速前往報到</span>
+              </div>
+              <span class="text-[10px] font-mono bg-slate-950 text-amber-400 px-1.5 py-0.5 rounded font-bold">02:45</span>
+            </div>
+
+            <!-- 機台卡片內容 -->
+            <div class="bg-white p-3 rounded-2xl shadow-sm space-y-3">
+              <div class="flex justify-between items-center border-b pb-2">
+                <span class="text-xs font-black text-slate-900">帶鋸機</span>
+                <!-- ❶ 紅框標記：等候報到狀態 -->
+                <div class="relative red-target-box px-2 py-0.5 bg-amber-100 rounded-full">
+                  <span class="red-target-badge -top-3.5 right-0">❶ 狀態：等候報到</span>
+                  <span class="text-[10px] font-black text-amber-800">● 等候報到</span>
+                </div>
+              </div>
+
+              <div class="text-xs text-slate-600 space-y-1">
+                <div>時段：<strong class="text-slate-900 font-mono">10:00 ～ 10:20</strong></div>
+                <div>使用者：<strong>黃聖閎</strong></div>
+              </div>
+
+              <!-- ❷ 紅框標記：點擊開始使用按鈕 -->
+              <div class="relative red-target-box p-1 bg-white">
+                <span class="red-target-badge -top-3.5 left-2">❷ 點擊開始使用（進行報到）</span>
+                <button class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-black shadow-lg flex items-center justify-center gap-1.5">
+                  <span>🚀</span>
+                  <span>開始使用（報到）</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區與三大規則防呆 Warning -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          
+          <!-- 規則 1: 預約時段限制 -->
+          <div class="bg-slate-900/90 border-l-4 border-rose-500 rounded-2xl p-4 space-y-1.5">
+            <h5 class="text-rose-400 font-black flex items-center gap-1.5">
+              <span>🛑 規則一：時段預約「只有該時段才能按開始」</span>
+            </h5>
+            <p class="text-xs text-slate-300">
+              如果您預約的是<strong>下午 15:00</strong>，在早上 11:00 是<strong>無法</strong>按下開始的（系統會阻擋提示尚未到時段）。請於時段開始前 3 分鐘至時段內前往機台報到。
+            </p>
+          </div>
+
+          <!-- 規則 2: 現場排隊可提前 -->
+          <div class="bg-slate-900/90 border-l-4 border-emerald-500 rounded-2xl p-4 space-y-1.5">
+            <h5 class="text-emerald-400 font-black flex items-center gap-1.5">
+              <span>⚡ 規則二：現場排隊「前面無人可提早開始」</span>
+            </h5>
+            <p class="text-xs text-slate-300">
+              若是現場排隊，且機台當前空閒、前面也沒有其他人在等候，您想要<strong>提早按開始使用是可以的</strong>！不用等到推算的預計結束時間。
+            </p>
+          </div>
+
+          <!-- 規則 3: 逾時順延機制 -->
+          <div class="bg-slate-900/90 border-l-4 border-amber-500 rounded-2xl p-4 space-y-1.5">
+            <h5 class="text-amber-400 font-black flex items-center gap-1.5">
+              <span>🔄 規則三：逾時未報到「不取消，改自動順延」</span>
+            </h5>
+            <p class="text-xs text-slate-300">
+              超過 3 分鐘未報到時：<br>
+              • <strong>若後面沒有人排隊</strong>：保留您的報到資格，隨時來隨時可以按開始！<br>
+              • <strong>若後面有人排隊</strong>：系統直接調換順序，讓後面的人先用，<strong class="text-amber-300">您的時段自動往後順延</strong>到他後面！<br>
+              • <strong>若後面是預約，預約後有排隊</strong>：排隊的同學會被拉到前面替補空檔，您同樣順延。
+            </p>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 06：機台使用中與結束使用 -->
+    <!-- ========================================================================= -->
+    <section id="step-6" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">6</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟六：機台使用中與結束使用</h3>
+          <p class="text-xs text-slate-400">操作完畢請務必主動點擊結束，釋放機台給下一位同學</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-white text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <div class="space-y-4 my-2">
+              <!-- ❶ 紅框標記：使用中倒數計時 -->
+              <div class="relative red-target-box p-3 bg-rose-50 border-rose-200 rounded-2xl text-center">
+                <span class="red-target-badge -top-3.5 left-2">❶ 留意剩餘時間</span>
+                <span class="text-[10px] font-bold text-rose-600 block">機台使用中</span>
+                <div class="font-mono font-black text-2xl text-rose-700 my-1">
+                  14:32
+                </div>
+                <span class="text-[9px] text-slate-500">預計 10:20 結束</span>
+              </div>
+
+              <!-- ❷ 紅框標記：結束使用按鈕 -->
+              <div class="relative red-target-box p-1 bg-white">
+                <span class="red-target-badge -top-3 left-2">❷ 提早做完請點「結束使用」</span>
+                <button class="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-black shadow-md flex items-center justify-center gap-1.5">
+                  <span>🏁</span>
+                  <span>提早結束使用</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              遵守操作時間
+            </h5>
+            <p>機台啟動後會開始倒數。請在時限內完成加工作業，並預留約 2～3 分鐘清理工作台木屑。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              提早做完主動釋出
+            </h5>
+            <p>
+              若您提早完成，請務必按下「<strong class="text-white">結束使用</strong>」按鈕。系統會立即將機台切換為空閒，並向下一位等候同學發送叫號通知，讓工廠運作更順暢！
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 步驟 07：我的預約與取消退訂 -->
+    <!-- ========================================================================= -->
+    <section id="step-7" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-red-500 text-white font-black flex items-center justify-center text-lg shadow-lg shadow-red-500/30">7</span>
+        <div>
+          <h3 class="text-xl font-black text-white">步驟七：查看我的預約與取消退訂</h3>
+          <p class="text-xs text-slate-400">集中管理您的所有預約時段，若臨時無法前來請務必提前取消</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+        <!-- 手機 Mockup 畫面 -->
+        <div class="lg:col-span-5 flex justify-center">
+          <div class="w-full max-w-[320px] bg-slate-100 text-slate-900 rounded-[36px] border-[8px] border-slate-700 shadow-2xl p-3 overflow-hidden relative">
+            <div class="bg-white p-2.5 rounded-xl shadow-xs mb-3 flex justify-between items-center">
+              <span class="text-xs font-black text-slate-900">📋 我的預約行程</span>
+              <span class="text-[10px] text-blue-600 font-bold">1 筆進行中</span>
+            </div>
+
+            <!-- 預約卡片 -->
+            <div class="bg-white p-3 rounded-2xl shadow-sm space-y-2 mb-4">
+              <div class="flex justify-between items-center text-xs">
+                <span class="font-black text-slate-900">13. 帶鋸機</span>
+                <span class="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-[10px] font-bold">時段預約</span>
+              </div>
+              <div class="text-[11px] text-slate-600">
+                時段：<strong class="text-slate-900 font-mono">13:30 ～ 14:00</strong> (30分)
+              </div>
+
+              <!-- ❷ 紅框標記：取消預約按鈕 -->
+              <div class="relative red-target-box p-1 bg-white">
+                <span class="red-target-badge -top-3 left-2">❷ 點此取消預約</span>
+                <button class="w-full py-1.5 bg-rose-50 text-rose-600 border border-rose-200 rounded-lg text-xs font-bold hover:bg-rose-100">
+                  ✕ 取消這筆預約
+                </button>
+              </div>
+            </div>
+
+            <!-- ❶ 紅框標記：底部導覽列 -->
+            <div class="relative red-target-box p-1 bg-white rounded-2xl shadow-lg flex justify-around">
+              <span class="red-target-badge -top-3.5 left-2">❶ 切換底部「我的預約」分頁</span>
+              <div class="p-1.5 text-center text-slate-400 text-[10px]">
+                <div>🪚</div>
+                <div>機台列表</div>
+              </div>
+              <div class="p-1.5 text-center text-blue-600 text-[10px] font-bold">
+                <div>📋</div>
+                <div>我的預約</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 說明文字區 -->
+        <div class="lg:col-span-7 space-y-4 text-sm leading-relaxed text-slate-300">
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❶</span>
+              隨時查看個人行程
+            </h5>
+            <p>點選 App 最底部的「<strong class="text-white">📋 我的預約</strong>」標籤，可以一眼看清自己今天所有的機台預約與排隊狀態。</p>
+          </div>
+
+          <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+            <h5 class="text-white font-bold flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-black">❷</span>
+              禮貌退訂、提早取消
+            </h5>
+            <p>
+              若進度變更不需要使用機台，請在預約開始前點擊「<strong class="text-rose-400">取消預約</strong>」。系統會自動將名額釋出給下一位排隊的同學，保持良好工場互助習慣！
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================================= -->
+    <!-- 常見問題 FAQ -->
+    <!-- ========================================================================= -->
+    <section id="faq" class="step-card bg-slate-800/60 border border-slate-700/70 rounded-3xl p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="flex items-center gap-3 border-b border-slate-700/70 pb-4">
+        <span class="w-9 h-9 rounded-2xl bg-blue-600 text-white font-black flex items-center justify-center text-lg shadow-lg">❓</span>
+        <div>
+          <h3 class="text-xl font-black text-white">常見問題與疑難排解 (FAQ)</h3>
+          <p class="text-xs text-slate-400">整理同學最常遇到的預約問題與解答</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+        <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+          <h5 class="font-bold text-white flex items-center gap-2">
+            <span class="text-blue-400">Q1.</span> 為什麼我下午 3 點的預約，現在不能按開始？
+          </h5>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            時段預約有嚴格的時程限制！為了避免霸佔機台影響前面同學，時段預約<strong>只有在該預約時段開始後才能點擊開始</strong>。若是現場排隊且機台空閒，才可以提早開始。
+          </p>
+        </div>
+
+        <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+          <h5 class="font-bold text-white flex items-center gap-2">
+            <span class="text-blue-400">Q2.</span> 輪到我時剛好走開，我的預約會被取消嗎？
+          </h5>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            <strong>不會直接取消！</strong> 系統新機制會自動調換順序：若後面有人排隊，會讓後面同學先用，您的順序會<strong>往後順延</strong>到他後面；若後面沒人，您的報到資格會持續保留。
+          </p>
+        </div>
+
+        <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+          <h5 class="font-bold text-white flex items-center gap-2">
+            <span class="text-blue-400">Q3.</span> 我們同一組要一起切木料，該怎麼預約？
+          </h5>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            由其中一位同學發起預約，並在表單「共同組員」中勾選其他組員（最多勾 4 位）。人數愈多使用時長愈長（上限 5 人 60 分鐘），且組員的手機與信箱都會同步收到通知！
+          </p>
+        </div>
+
+        <div class="bg-slate-900/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+          <h5 class="font-bold text-white flex items-center gap-2">
+            <span class="text-blue-400">Q4.</span> 為什麼系統顯示「跨機台衝堂」無法預約？
+          </h5>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            為了公平性，同一位同學在同一時間<strong>不能在兩台機台同時預約或排隊</strong>。請更換其他沒有時段衝突的時間，或等目前機台使用完畢後再排下一台。
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 頁尾 -->
+  <footer class="border-t border-slate-800 bg-slate-950 py-8 text-center text-xs text-slate-500 space-y-2">
+    <div>木工機台預約排隊系統 • 國立高雄師範大學 工業設計學系</div>
+    <div>本手冊由 AI 輔助產生 • 適用於 14 台正式木工機台與 27 位正式修課學生</div>
+  </footer>
+
+</body>
+</html>

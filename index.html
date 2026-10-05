@@ -4108,8 +4108,18 @@
                 </div>
               </div>
 
-              {/* 右側重新整理按鈕：醒目向量旋轉圖標 (點擊觸發旋轉動畫與強制重新整理) */}
+              {/* 右側操作按鈕：學生操作指引 + 重新整理按鈕 */}
               <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                <a
+                  href="guide.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="p-1.5 text-slate-700 hover:text-blue-600 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 rounded-xl transition-all shadow-2xs active:scale-95 cursor-pointer flex items-center justify-center"
+                  title="開啟學生操作指引手冊"
+                >
+                  <span className="text-sm leading-none">📖</span>
+                </a>
+
                 <button
                   onClick={handleManualRefresh}
                   disabled={isRefreshing}
