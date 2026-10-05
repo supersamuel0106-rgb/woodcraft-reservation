@@ -26,6 +26,9 @@
   <!-- EmailJS SDK（用於叫號與時段提醒 Email 通知）-->
   <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 
+  <!-- SortableJS CDN（用於助教控制面板拖曳調整排隊順序）-->
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+
   <style>
     body {
       font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -444,6 +447,113 @@
         return { canStart: false, reason: `前面還有【${(ahead.students || []).join(', ')}】（${ahead.startTimeFormatted} ～ ${ahead.endTimeFormatted}）尚未使用，請依順序等候叫號。` };
       }
       return { canStart: true, reason: '' };
+    }
+
+    /**
+     * 重新計算機台隊列時間（用於助教拖曳調動順序）
+     * NOTE: 核心規則
+     * 1. 現場排隊：依新順序緊接排列，起始時間為 baseStartMin
+     * 2. 時段預約（未被手動拖曳者）：保留原預約時間，若被前面排程擠壓則自動順延
+     * 3. 時段預約（被助教刻意拖曳者）：視為助教主動調動，緊接在當前排程位置
+     * @param {Array} orderedItems 排序後的待處理預約陣列
+     * @param {string|null} movedId 剛被助教拖曳移動的預約 ID
+     * @param {number} baseStartMin 隊列可開始的最早時間（分鐘）
+     * @returns {Array} 包含新 startMinutes, endMinutes, startTimeFormatted, endTimeFormatted 的陣列
+     */
+    function recalculateMachineSchedule(orderedItems, movedId, baseStartMin) {
+      let currentTime = baseStartMin;
+      const result = [];
+
+      for (const item of orderedItems) {
+        let start;
+        if (item.type === '時段預約') {
+          if (item.id === movedId) {
+            // 助教刻意拖動該時段預約，讓其緊接在前面的人之後
+            start = currentTime;
+          } else {
+            // 未被手動拖曳的時段預約，保留原本預約時間，若被前面擠到才往後順延
+            start = Math.max(currentTime, item.startMinutes);
+          }
+        } else {
+          // 現場排隊：依序緊接前面的人
+          start = currentTime;
+        }
+        const dur = item.durationMinutes || 20;
+        const end = start + dur;
+        result.push({
+          ...item,
+          startMinutes: start,
+          endMinutes: end,
+          startTimeFormatted: minutesToTime(start),
+          endTimeFormatted: minutesToTime(end)
+        });
+        currentTime = end;
+      }
+      return result;
+    }
+
+    /**
+     * 手動推移/提前單筆預約時間（用於助教手動延遲/提前按鈕）
+     * @param {Array} waitingItems 該機台目前所有等候/排隊中的預約清單
+     * @param {string} targetId 欲調整的預約 ID
+     * @param {number} deltaMinutes 變更的分鐘數（正數為延遲、負數為提前）
+     * @param {number} baseStartMin 機台當前最早可開始時間
+     * @returns {Array} 更新時間後的預約陣列
+     */
+    function shiftReservationSchedule(waitingItems, targetId, deltaMinutes, baseStartMin) {
+      const targetIdx = waitingItems.findIndex(x => x.id === targetId);
+      if (targetIdx === -1) return waitingItems;
+
+      const target = waitingItems[targetIdx];
+      // 提前時，不可早於機台最快可用時間，也不可早於前一位同學的結束時間
+      let prevEnd = baseStartMin;
+      if (targetIdx > 0) {
+        prevEnd = Math.max(baseStartMin, waitingItems[targetIdx - 1].endMinutes);
+      }
+
+      let newStart = target.startMinutes + deltaMinutes;
+      if (newStart < prevEnd) {
+        newStart = prevEnd;
+      }
+      const dur = target.durationMinutes || 20;
+      const newEnd = newStart + dur;
+
+      const result = [];
+      // 目標之前的預約維持不變
+      for (let i = 0; i < targetIdx; i++) {
+        result.push({ ...waitingItems[i] });
+      }
+
+      // 目標預約設定新時間
+      result.push({
+        ...target,
+        startMinutes: newStart,
+        endMinutes: newEnd,
+        startTimeFormatted: minutesToTime(newStart),
+        endTimeFormatted: minutesToTime(newEnd)
+      });
+
+      // 目標之後的預約，若被推擠則依序往後順延
+      let runningCurrent = newEnd;
+      for (let i = targetIdx + 1; i < waitingItems.length; i++) {
+        const item = waitingItems[i];
+        let s = item.startMinutes;
+        if (s < runningCurrent) {
+          s = runningCurrent;
+        }
+        const d = item.durationMinutes || 20;
+        const e = s + d;
+        result.push({
+          ...item,
+          startMinutes: s,
+          endMinutes: e,
+          startTimeFormatted: minutesToTime(s),
+          endTimeFormatted: minutesToTime(e)
+        });
+        runningCurrent = e;
+      }
+
+      return result;
     }
 
     // 計算現場排隊即時起始時間（推算目前機台最早可接續的時間點，若有任何衝突自動往後推至最早可用時段）
@@ -1481,6 +1591,178 @@
         await refreshData();
       };
 
+      /**
+       * 助教/管理員手動拖曳重新排序機台等候名單
+       * @param {string} machineId 機台 ID
+       * @param {Array<string>} orderedIds 排序後的 reservation ID 清單
+       * @param {string|null} movedId 剛被拖動的 reservation ID
+       */
+      const reorderMachineQueue = async (machineId, orderedIds, movedId = null) => {
+        if (!supabaseClient) return { success: false, message: '尚未連線至資料庫' };
+
+        // 1. 取得該機台等候中的預約清單
+        const macWaiting = reservations.filter(r => 
+          r.machineId === machineId && 
+          (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中')
+        );
+
+        if (macWaiting.length === 0) return { success: true };
+
+        // 依照 orderedIds 進行排序
+        const idMap = new Map(orderedIds.map((id, idx) => [id, idx]));
+        const orderedList = [...macWaiting].sort((a, b) => {
+          const idxA = idMap.has(a.id) ? idMap.get(a.id) : 999;
+          const idxB = idMap.has(b.id) ? idMap.get(b.id) : 999;
+          return idxA - idxB;
+        });
+
+        const now = new Date();
+        const nowMin = now.getHours() * 60 + now.getMinutes();
+        const roundedNow = Math.ceil(nowMin / 10) * 10;
+
+        // 檢查機台當前是否有「使用中」
+        const inUse = reservations.find(r => r.machineId === machineId && r.status === '使用中');
+        const baseStartMin = inUse ? inUse.endMinutes : roundedNow;
+
+        // 2. 重新計算時程
+        const recalculated = recalculateMachineSchedule(orderedList, movedId, baseStartMin);
+
+        // 3. 跨機台衝堂檢查（警告但不阻擋助教決定）
+        const conflictWarnings = [];
+        for (const item of recalculated) {
+          const c = findStudentConflict(reservations, item.students, item.email, item.startMinutes, item.durationMinutes, item.id);
+          if (c) {
+            conflictWarnings.push(`同學【${(item.students || []).join(', ')}】在【${c.machineName}】（${c.startTimeFormatted} ～ ${c.endTimeFormatted}）有衝堂`);
+          }
+        }
+        if (conflictWarnings.length > 0) {
+          const confirmMsg = `⚠️ 順序調動後發現有同學跨機台衝堂：\n\n${conflictWarnings.slice(0, 3).join('\n')}${conflictWarnings.length > 3 ? '\n...等' : ''}\n\n助教是否仍要確定儲存此順序？`;
+          if (!window.confirm(confirmMsg)) {
+            await refreshData();
+            return { success: false, message: '助教已取消調整' };
+          }
+        }
+
+        // 4. 批次更新狀態與時間
+        const updates = [];
+        for (let i = 0; i < recalculated.length; i++) {
+          const item = recalculated[i];
+          const isFirst = (i === 0 && !inUse);
+          let newStatus = '排隊中';
+          let calledAt = null;
+
+          if (isFirst) {
+            if (item.type === '現場排隊') {
+              newStatus = '等候報到';
+              calledAt = item.calledAt || now.toISOString();
+            } else if (item.type === '時段預約') {
+              if (nowMin >= item.startMinutes) {
+                newStatus = '等候報到';
+                calledAt = item.calledAt || now.toISOString();
+              } else {
+                newStatus = '排隊中';
+              }
+            }
+          }
+
+          const payload = {
+            start_minutes: item.startMinutes,
+            end_minutes: item.endMinutes,
+            start_time_formatted: item.startTimeFormatted,
+            end_time_formatted: item.endTimeFormatted,
+            status: newStatus,
+            called_at: calledAt,
+            advance_offered_at: null
+          };
+          updates.push(supabaseClient.from('reservations').update(payload).eq('id', item.id));
+        }
+
+        await Promise.all(updates);
+
+        // 5. 更新機台狀態
+        const firstItem = recalculated[0];
+        let machineStatus = '空閒';
+        if (inUse) {
+          machineStatus = '使用中';
+        } else if (firstItem && (firstItem.status === '等候報到' || (firstItem.type === '現場排隊' && nowMin >= firstItem.startMinutes))) {
+          machineStatus = '等待報到';
+        }
+        await supabaseClient.from('machines').update({ status: machineStatus }).eq('id', machineId);
+
+        // 6. 若第一位換成新的排隊同學，發送叫號通知
+        if (!inUse && recalculated.length > 0 && recalculated[0].type === '現場排隊') {
+          const newTop = recalculated[0];
+          const prevTop = macWaiting[0];
+          if (!prevTop || prevTop.id !== newTop.id) {
+            sendQueueCallNotification({
+              studentNames: newTop.students.join(', '),
+              machineName: newTop.machineName,
+              startTime: newTop.startTimeFormatted,
+              endTime: newTop.endTimeFormatted,
+              durationMinutes: newTop.durationMinutes,
+              toEmail: newTop.email || ''
+            });
+          }
+        }
+
+        await refreshData();
+        return { success: true };
+      };
+
+      /**
+       * 助教手動延遲或提前單筆預約時間
+       * @param {string} reservationId 欲調整的預約 ID
+       * @param {number} deltaMinutes 變更的分鐘數（+10 延後, -10 提前）
+       */
+      const shiftReservationTime = async (reservationId, deltaMinutes) => {
+        if (!supabaseClient) return { success: false, message: '尚未連線至資料庫' };
+        const target = reservations.find(r => r.id === reservationId);
+        if (!target) return { success: false, message: '找不到此預約' };
+
+        const machineId = target.machineId;
+        const macWaiting = reservations
+          .filter(r => 
+            r.machineId === machineId && 
+            (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中')
+          )
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        const now = new Date();
+        const nowMin = now.getHours() * 60 + now.getMinutes();
+        const roundedNow = Math.ceil(nowMin / 10) * 10;
+        const inUse = reservations.find(r => r.machineId === machineId && r.status === '使用中');
+        const baseStartMin = inUse ? inUse.endMinutes : roundedNow;
+
+        const shiftedList = shiftReservationSchedule(macWaiting, reservationId, deltaMinutes, baseStartMin);
+
+        // 檢查衝堂
+        const conflictWarnings = [];
+        for (const item of shiftedList) {
+          const c = findStudentConflict(reservations, item.students, item.email, item.startMinutes, item.durationMinutes, item.id);
+          if (c) {
+            conflictWarnings.push(`同學【${(item.students || []).join(', ')}】在【${c.machineName}】（${c.startTimeFormatted} ～ ${c.endTimeFormatted}）有衝堂`);
+          }
+        }
+        if (conflictWarnings.length > 0) {
+          const confirmMsg = `⚠️ 時間調整後發現有同學跨機台衝堂：\n\n${conflictWarnings.slice(0, 3).join('\n')}${conflictWarnings.length > 3 ? '\n...等' : ''}\n\n助教是否仍要確定調整？`;
+          if (!window.confirm(confirmMsg)) {
+            return { success: false, message: '助教已取消調整' };
+          }
+        }
+
+        const updates = shiftedList.map(item => 
+          supabaseClient.from('reservations').update({
+            start_minutes: item.startMinutes,
+            end_minutes: item.endMinutes,
+            start_time_formatted: item.startTimeFormatted,
+            end_time_formatted: item.endTimeFormatted
+          }).eq('id', item.id)
+        );
+        await Promise.all(updates);
+        await refreshData();
+        return { success: true };
+      };
+
       return (
         <AppContext.Provider value={{
           machines,
@@ -1511,6 +1793,8 @@
           acceptEarlyStart,
           declineEarlyStart,
           updateSettings,
+          reorderMachineQueue,
+          shiftReservationTime,
           refreshData
         }}>
           {children}
@@ -2883,28 +3167,404 @@
       );
     }
 
+    /**
+     * 單一機台之預約管理與排隊拖曳卡片元件 (助教控制面板專用)
+     * 支援 SortableJS 拖曳調動排隊順序、手動順延/提前時段
+     */
+    function AdminMachineQueueCard({
+      mac,
+      allReservations,
+      filterStatus,
+      onReorder,
+      onShift,
+      onStart,
+      onFinish,
+      onCancel
+    }) {
+      const sortableRef = useRef(null);
+      const sortableInst = useRef(null);
+      const [isUpdating, setIsUpdating] = useState(false);
+
+      // 分類該機台的預約
+      const macAll = useMemo(() => {
+        return allReservations
+          .filter(r => r.machineId === mac.id)
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+      }, [allReservations, mac.id]);
+
+      const inUseRes = useMemo(() => {
+        return macAll.find(r => r.status === '使用中');
+      }, [macAll]);
+
+      const waitingQueue = useMemo(() => {
+        return macAll.filter(r => 
+          r.status === '等候報到' || 
+          r.status === '等候提前確認' || 
+          r.status === '排隊中' || 
+          r.status === '等待中'
+        );
+      }, [macAll]);
+
+      const historyRes = useMemo(() => {
+        return macAll.filter(r => 
+          r.status === '已完成' || 
+          r.status === '已取消' || 
+          r.status === '未報到'
+        );
+      }, [macAll]);
+
+      // 初始化 SortableJS 拖曳排序
+      useEffect(() => {
+        if (!sortableRef.current || !window.Sortable) return;
+        if (sortableInst.current) {
+          sortableInst.current.destroy();
+        }
+
+        sortableInst.current = new window.Sortable(sortableRef.current, {
+          handle: '.drag-handle',
+          animation: 180,
+          ghostClass: 'bg-indigo-50/80',
+          chosenClass: 'bg-indigo-100/60',
+          dragClass: 'shadow-2xl',
+          onEnd: async (evt) => {
+            const { oldIndex, newIndex } = evt;
+            if (oldIndex == null || newIndex == null || oldIndex === newIndex) return;
+
+            const movedItem = waitingQueue[oldIndex];
+            const newOrder = [...waitingQueue];
+            const [removed] = newOrder.splice(oldIndex, 1);
+            newOrder.splice(newIndex, 0, removed);
+
+            setIsUpdating(true);
+            try {
+              await onReorder(mac.id, newOrder.map(r => r.id), movedItem ? movedItem.id : null);
+            } finally {
+              setIsUpdating(false);
+            }
+          }
+        });
+
+        return () => {
+          if (sortableInst.current) {
+            sortableInst.current.destroy();
+            sortableInst.current = null;
+          }
+        };
+      }, [waitingQueue, mac.id, onReorder]);
+
+      const handleShiftCustom = async (res) => {
+        const input = window.prompt(`請輸入要為【${res.students.join(', ')}】調整的分鐘數：\n（例如：+10 延後十分鐘、-10 提前十分鐘、+30 延前半小時）`, '+10');
+        if (!input) return;
+        const delta = parseInt(input, 10);
+        if (isNaN(delta) || delta === 0) {
+          alert('請輸入有效的非零整數分鐘（如 10、-10）');
+          return;
+        }
+        setIsUpdating(true);
+        try {
+          await onShift(res.id, delta);
+        } finally {
+          setIsUpdating(false);
+        }
+      };
+
+      const handleShiftClick = async (resId, delta) => {
+        setIsUpdating(true);
+        try {
+          await onShift(resId, delta);
+        } finally {
+          setIsUpdating(false);
+        }
+      };
+
+      // 依 filterStatus 決定顯示哪些區塊
+      const showInUse = filterStatus === 'ALL' || filterStatus === 'ACTIVE';
+      const showWaiting = filterStatus === 'ALL' || filterStatus === 'ACTIVE';
+      const showHistory = filterStatus === 'ALL' || filterStatus === 'COMPLETED' || filterStatus === 'CANCELLED';
+
+      const totalVisible = 
+        (showInUse && inUseRes ? 1 : 0) +
+        (showWaiting ? waitingQueue.length : 0) +
+        (showHistory ? historyRes.length : 0);
+
+      return (
+        <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-xs relative">
+          {/* 載入中遮罩 */}
+          {isUpdating && (
+            <div className="absolute inset-0 bg-white/70 backdrop-blur-xs z-20 flex items-center justify-center">
+              <div className="text-xs font-bold text-indigo-700 bg-white px-3.5 py-1.5 rounded-full shadow-md border border-indigo-100 flex items-center gap-1.5 animate-pulse">
+                <span>🔄</span>
+                <span>正在重新計算並儲存排程...</span>
+              </div>
+            </div>
+          )}
+
+          {/* 機台標頭 */}
+          <div className="p-4 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+            <div>
+              <h3 className="text-base font-bold text-slate-900 leading-tight">{mac.name}</h3>
+              <div className="text-[10px] text-slate-500 font-semibold mt-0.5 flex items-center gap-2">
+                <span>使用中: {inUseRes ? '1' : '0'}</span>
+                <span>•</span>
+                <span>等候/排隊: {waitingQueue.length}</span>
+                {historyRes.length > 0 && <span>• 歷史: {historyRes.length}</span>}
+              </div>
+            </div>
+
+            <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+              mac.status === '使用中' 
+                ? 'bg-red-50 text-red-700 border-red-200 animate-pulse' 
+                : mac.status === '等待報到' 
+                ? 'bg-amber-50 text-amber-700 border-amber-200' 
+                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+            }`}>
+              {mac.status === '使用中' ? '🔴 使用中' : mac.status === '等待報到' ? '🟡 等待報到' : '🟢 空閒'}
+            </span>
+          </div>
+
+          {/* 總體無預約 */}
+          {totalVisible === 0 ? (
+            <div className="p-6 text-center text-xs text-slate-400 font-semibold">
+              📭 目前無符合此篩選條件的預約紀錄
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100">
+              {/* 1. 使用中區塊 (固定不可拖曳) */}
+              {showInUse && inUseRes && (
+                <div className="p-4 bg-red-50/40 border-l-4 border-l-red-500">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-800 border border-red-200 animate-pulse">
+                          🔴 使用中
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
+                          {inUseRes.type}
+                        </span>
+                      </div>
+                      <h4 className="text-sm font-extrabold text-slate-900">
+                        👤 {inUseRes.students.join(', ')}
+                      </h4>
+                      <div className="text-xs text-red-700 font-bold flex items-center gap-2">
+                        <span>🕒 {inUseRes.startTimeFormatted} ～ {inUseRes.endTimeFormatted}</span>
+                        <span>({inUseRes.durationMinutes} 分鐘)</span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(`確定結束【${inUseRes.students.join(', ')}】的使用嗎？\n系統將自動叫號下一位排隊同學！`)) {
+                          onFinish(mac.id, inUseRes.id);
+                        }
+                      }}
+                      className="py-1.5 px-3 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-700 active:scale-95 shadow-sm shadow-red-500/20 cursor-pointer shrink-0"
+                      title="結束使用"
+                    >
+                      ⏹ 結束
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 2. 可調度排隊/等候名單區塊 (支援 SortableJS 拖曳排序) */}
+              {showWaiting && (
+                <div>
+                  {waitingQueue.length > 0 && (
+                    <div className="px-4 py-2 bg-indigo-50/50 border-b border-indigo-100/50 flex items-center justify-between text-[11px] text-indigo-700 font-semibold">
+                      <div className="flex items-center gap-1">
+                        <span>💡</span>
+                        <span>按住 <strong>⠿</strong> 可上下拖曳調動順序，或點 <strong>⏪/⏩</strong> 調整時段</span>
+                      </div>
+                      <span className="text-[10px] bg-indigo-100/80 px-2 py-0.5 rounded-full">
+                        共 {waitingQueue.length} 筆待使用
+                      </span>
+                    </div>
+                  )}
+
+                  <div ref={sortableRef} className="divide-y divide-slate-100">
+                    {waitingQueue.map((res, qIdx) => {
+                      const isWait = res.status === '等候報到';
+                      const isOffer = res.status === '等候提前確認';
+
+                      return (
+                        <div 
+                          key={res.id} 
+                          data-id={res.id}
+                          className={`p-3.5 transition-colors flex items-start gap-2.5 ${
+                            isWait ? 'bg-amber-50/35' : isOffer ? 'bg-indigo-50/20' : 'hover:bg-slate-50/80'
+                          }`}
+                        >
+                          {/* 拖曳把手 */}
+                          <div 
+                            className="drag-handle touch-none cursor-grab active:cursor-grabbing p-1.5 text-slate-400 hover:text-indigo-600 active:text-indigo-800 select-none flex items-center justify-center rounded-xl hover:bg-slate-100 transition-colors shrink-0 mt-0.5" 
+                            title="按住拖曳調換排隊順序"
+                          >
+                            <span className="text-lg leading-none font-bold">⠿</span>
+                          </div>
+
+                          {/* 排隊順序序號徽章 */}
+                          <div className="w-5 h-5 rounded-full bg-slate-100 text-slate-600 font-bold text-[10px] flex items-center justify-center shrink-0 mt-1">
+                            {qIdx + 1}
+                          </div>
+
+                          {/* 預約詳情 */}
+                          <div className="flex-1 min-w-0 space-y-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                                res.type === '現場排隊' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'
+                              }`}>
+                                {res.type === '現場排隊' ? '⚡ 現場排隊' : '🕒 時段預約'}
+                              </span>
+
+                              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                isWait 
+                                  ? 'bg-amber-100 text-amber-800 border-amber-300 animate-pulse' 
+                                  : isOffer 
+                                  ? 'bg-indigo-100 text-indigo-800 border-indigo-200' 
+                                  : 'bg-blue-50 text-blue-700 border-blue-200'
+                              }`}>
+                                {res.status}
+                              </span>
+                            </div>
+
+                            <h4 className="text-sm font-bold text-slate-900 truncate">
+                              👤 {res.students.join(', ')}
+                            </h4>
+
+                            <div className="text-xs text-slate-600 font-semibold flex items-center gap-2 flex-wrap">
+                              <span className="font-mono">🕒 {res.startTimeFormatted} ～ {res.endTimeFormatted}</span>
+                              <span className="text-slate-400">({res.durationMinutes} 分鐘)</span>
+                            </div>
+
+                            {res.email && (
+                              <div className="text-[10px] text-slate-400 truncate">
+                                ✉️ {res.email} {res.calledAt ? `• 叫號於 ${new Date(res.calledAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}` : ''}
+                              </div>
+                            )}
+
+                            {/* 助教時段手動微調按鈕組 */}
+                            <div className="pt-1.5 flex items-center gap-1 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => handleShiftClick(res.id, -10)}
+                                className="px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-600 text-[10px] font-bold border border-slate-200 transition-colors active:scale-95 cursor-pointer"
+                                title="將此預約提前 10 分鐘"
+                              >
+                                ⏪ -10分
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleShiftClick(res.id, 10)}
+                                className="px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-600 text-[10px] font-bold border border-slate-200 transition-colors active:scale-95 cursor-pointer"
+                                title="將此預約延後 10 分鐘（後方排程將連動順延）"
+                              >
+                                ⏩ +10分
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleShiftCustom(res)}
+                                className="px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-[10px] font-semibold border border-slate-200 transition-colors active:scale-95 cursor-pointer"
+                                title="自訂調整分鐘數"
+                              >
+                                ⏱️ 自訂
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* 管理員即時操作快捷鈕 */}
+                          <div className="flex flex-col gap-1 shrink-0 pt-0.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const nd = new Date();
+                                const elig = getStartEligibility(res, allReservations, nd.getHours() * 60 + nd.getMinutes());
+                                const msg = elig.canStart
+                                  ? `確定將【${res.students.join(', ')}】設為開始使用機台嗎？`
+                                  : `⚠️ 依規則目前不可開始：\n${elig.reason}\n\n確定要以管理員身分強制將【${res.students.join(', ')}】設為開始使用嗎？`;
+                                if (window.confirm(msg)) {
+                                  onStart(mac.id, res.id, true);
+                                }
+                              }}
+                              className="py-1.5 px-2.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 active:scale-95 shadow-xs cursor-pointer text-center"
+                              title="立即開始使用 (報到)"
+                            >
+                              ▶ 開始
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (window.confirm(`確定要取消【${res.students.join(', ')}】的預約嗎？`)) {
+                                  onCancel(res.id);
+                                }
+                              }}
+                              className="py-1 px-2.5 rounded-xl bg-slate-100 text-red-600 text-xs font-bold hover:bg-red-50 active:scale-95 border border-slate-200 cursor-pointer text-center"
+                              title="取消此預約"
+                            >
+                              ✕ 取消
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* 3. 已完成 / 已取消歷史紀錄區塊 */}
+              {showHistory && historyRes.length > 0 && (
+                <div className="bg-slate-50/50">
+                  <div className="px-4 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                    歷史紀錄（{historyRes.length}）
+                  </div>
+                  <div className="divide-y divide-slate-100">
+                    {historyRes.map(res => (
+                      <div key={res.id} className="p-3.5 flex items-center justify-between text-slate-400">
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-semibold">
+                              {res.type}
+                            </span>
+                            <span className="text-xs font-semibold text-slate-600">
+                              {res.students.join(', ')}
+                            </span>
+                          </div>
+                          <div className="text-[11px] font-mono">
+                            🕒 {res.startTimeFormatted} ～ {res.endTimeFormatted}
+                          </div>
+                        </div>
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                          res.status === '已完成' 
+                            ? 'bg-slate-100 text-slate-600 border-slate-200' 
+                            : 'bg-red-50 text-red-500 border-red-200'
+                        }`}>
+                          {res.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // ============================================================
     // 9.5 管理者預約總覽 (AdminReservationsOverviewView)
     // 依機台順序展示全班所有預約場次、排隊與狀態
     // ============================================================
     function AdminReservationsOverviewView({ onBack }) {
-      const { machines, reservations, startMachineUsage, finishMachineUsage, cancelReservation } = useApp();
+      const { 
+        machines, 
+        reservations, 
+        startMachineUsage, 
+        finishMachineUsage, 
+        cancelReservation,
+        reorderMachineQueue,
+        shiftReservationTime
+      } = useApp();
       const [filterStatus, setFilterStatus] = useState('ALL'); // 'ALL', 'ACTIVE', 'COMPLETED', 'CANCELLED'
-
-      // 篩選預約
-      const filteredReservations = useMemo(() => {
-        if (filterStatus === 'ALL') return reservations;
-        if (filterStatus === 'ACTIVE') {
-          return reservations.filter(r => r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中');
-        }
-        if (filterStatus === 'COMPLETED') {
-          return reservations.filter(r => r.status === '已完成');
-        }
-        if (filterStatus === 'CANCELLED') {
-          return reservations.filter(r => r.status === '已取消' || r.status === '未報到');
-        }
-        return reservations;
-      }, [reservations, filterStatus]);
 
       // 統計數據
       const totalCount = reservations.length;
@@ -2967,159 +3627,21 @@
             ))}
           </div>
 
-          {/* 依機台順序排列的清單 */}
+          {/* 依機台順序排列的清單 (每個機台各自支援拖曳排序與手動微調) */}
           <div className="space-y-4">
-            {machines.map(mac => {
-              const macReservations = filteredReservations
-                .filter(r => r.machineId === mac.id)
-                .sort((a, b) => a.startMinutes - b.startMinutes);
-
-              const inUseRes = reservations.find(r => r.machineId === mac.id && r.status === '使用中');
-              const waitingRes = reservations.filter(r => r.machineId === mac.id && (r.status === '等候報到' || r.status === '排隊中'));
-
-              return (
-                <div key={mac.id} className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-xs">
-                  {/* 機台標頭 */}
-                  <div className="p-4 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
-                    <div>
-                      <h3 className="text-base font-bold text-slate-900 leading-tight">{mac.name}</h3>
-                      <div className="text-[10px] text-slate-500 font-semibold mt-0.5 flex items-center gap-2">
-                        <span>使用中: {inUseRes ? '1' : '0'}</span>
-                        <span>•</span>
-                        <span>排隊中: {waitingRes.length}</span>
-                      </div>
-                    </div>
-
-                    <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
-                      mac.status === '使用中' 
-                        ? 'bg-red-50 text-red-700 border-red-200 animate-pulse' 
-                        : mac.status === '等待報到' 
-                        ? 'bg-amber-50 text-amber-700 border-amber-200' 
-                        : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                    }`}>
-                      {mac.status === '使用中' ? '🔴 使用中' : mac.status === '等待報到' ? '🟡 等待報到' : '🟢 空閒'}
-                    </span>
-                  </div>
-
-                  {/* 該機台的預約列表 */}
-                  <div className="divide-y divide-slate-100">
-                    {macReservations.length === 0 ? (
-                      <div className="p-5 text-center text-xs text-slate-400 font-semibold">
-                        📭 目前無此分類的預約紀錄
-                      </div>
-                    ) : (
-                      macReservations.map(res => {
-                        const isInUse = res.status === '使用中';
-                        const isWait = res.status === '等候報到';
-                        const isQueue = res.status === '排隊中';
-                        const isFinished = res.status === '已完成' || res.status === '已取消' || res.status === '未報到';
-
-                        return (
-                          <div 
-                            key={res.id} 
-                            className={`p-4 transition-colors ${
-                              isInUse ? 'bg-red-50/30' : isWait ? 'bg-amber-50/30' : 'hover:bg-slate-50/60'
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="space-y-1">
-                                <div className="flex items-center gap-1.5 flex-wrap">
-                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                                    res.type === '現場排隊' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'
-                                  }`}>
-                                    {res.type === '現場排隊' ? '⚡ 現場排隊' : '🕒 時段預約'}
-                                  </span>
-
-                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                                    isInUse 
-                                      ? 'bg-red-100 text-red-800 border-red-200' 
-                                      : isWait 
-                                      ? 'bg-amber-100 text-amber-800 border-amber-300 animate-pulse' 
-                                      : isQueue 
-                                      ? 'bg-blue-50 text-blue-700 border-blue-200' 
-                                      : res.status === '已完成' 
-                                      ? 'bg-slate-100 text-slate-600 border-slate-200' 
-                                      : 'bg-red-50 text-red-500 border-red-200'
-                                  }`}>
-                                    {res.status}
-                                  </span>
-                                </div>
-
-                                <h4 className="text-sm font-bold text-slate-900 pt-0.5">
-                                  👤 {res.students.join(', ')}
-                                </h4>
-
-                                <div className="text-xs text-slate-600 font-semibold flex items-center gap-2">
-                                  <span>🕒 {res.startTimeFormatted} ～ {res.endTimeFormatted}</span>
-                                  <span>({res.durationMinutes} 分鐘)</span>
-                                </div>
-
-                                <div className="text-[10px] text-slate-400">
-                                  ✉️ {res.email} {res.calledAt ? `• 叫號於 ${new Date(res.calledAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}` : ''}
-                                </div>
-                              </div>
-
-                              {/* 管理員即時操作快捷鈕 */}
-                              {!isFinished && (
-                                <div className="flex items-center gap-1.5 shrink-0 pt-1">
-                                  {!isInUse ? (
-                                    <>
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          const nd = new Date();
-                                          const elig = getStartEligibility(res, reservations, nd.getHours() * 60 + nd.getMinutes());
-                                          // NOTE: 管理員可強制開始，但未符合規則時要明確提醒
-                                          const msg = elig.canStart
-                                            ? `確定將【${res.students.join(', ')}】設為開始使用機台嗎？`
-                                            : `⚠️ 依規則目前不可開始：\n${elig.reason}\n\n確定要以管理員身分強制將【${res.students.join(', ')}】設為開始使用嗎？`;
-                                          if (window.confirm(msg)) {
-                                            startMachineUsage(res.machineId, res.id, true);
-                                          }
-                                        }}
-                                        className="py-1.5 px-2.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 active:scale-95 shadow-xs cursor-pointer"
-                                        title="立即開始使用 (報到)"
-                                      >
-                                        ▶ 開始
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          if (window.confirm(`確定要取消【${res.students.join(', ')}】的預約嗎？`)) {
-                                            cancelReservation(res.id);
-                                          }
-                                        }}
-                                        className="py-1.5 px-2.5 rounded-xl bg-slate-100 text-red-600 text-xs font-bold hover:bg-red-50 active:scale-95 border border-slate-200 cursor-pointer"
-                                        title="取消此預約"
-                                      >
-                                        ✕
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        if (window.confirm(`確定結束【${res.students.join(', ')}】的使用嗎？\n系統將自動叫號下一位排隊同學！`)) {
-                                          finishMachineUsage(res.machineId, res.id);
-                                        }
-                                      }}
-                                      className="py-1.5 px-3 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-700 active:scale-95 shadow-sm shadow-red-500/20 cursor-pointer"
-                                      title="結束使用"
-                                    >
-                                      ⏹ 結束
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+            {machines.map(mac => (
+              <AdminMachineQueueCard
+                key={mac.id}
+                mac={mac}
+                allReservations={reservations}
+                filterStatus={filterStatus}
+                onReorder={reorderMachineQueue}
+                onShift={shiftReservationTime}
+                onStart={startMachineUsage}
+                onFinish={finishMachineUsage}
+                onCancel={cancelReservation}
+              />
+            ))}
           </div>
         </div>
       );
