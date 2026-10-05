@@ -827,10 +827,131 @@
         await refreshData();
       };
 
-      // NOTE: 自動過號與逾時取消掃描機制（每 8 秒自動輪詢）
-      // 1. 現場排隊叫號 3 分鐘未報到 ➔ 自動跳過、叫下一位
+      /**
+       * 逾時未報到處理（取代原本「直接取消」的做法）
+       * NOTE: 規則
+       * 1. 後面沒有可替補的現場排隊者 ➔ 什麼都不做，保留資格，仍可隨時報到
+       * 2. 後面有人現場排隊 ➔ 排隊者先使用，逾時者順延到他正後方
+       * 3. 後面是時段預約、預約之後才有排隊 ➔ 把該排隊者拉到前面替補（需能在下一筆預約開始前用完）
+       * 因為每次掃描都會重新判斷，若逾時者原本無人可替補、之後才有人排隊，也會在下一輪自動調換
+       * @param overdue 逾時未報到的預約/排隊
+       * @param snapshot 目前所有預約資料
+       * @param nowMinutes 目前時間（分鐘）
+       * @param graceMin 報到緩衝分鐘數
+       * @returns 是否有進行調換
+       */
+      const handleOverdueReservation = async (overdue, snapshot, nowMinutes, graceMin) => {
+        const WAITING_STATUSES = ['等候報到', '等候提前確認', '排隊中', '等待中'];
+        const sameMachine = snapshot.filter(x => x.machineId === overdue.machineId && x.id !== overdue.id);
+
+        // NOTE: 機台仍有人使用中（前一位超時），報到不了不是逾時者的責任，先不處理
+        if (sameMachine.some(x => x.status === '使用中')) return false;
+
+        const waitingList = sameMachine.filter(x => WAITING_STATUSES.includes(x.status));
+        const queueList = waitingList
+          .filter(x => x.type === '現場排隊')
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+        // 只有「尚未逾時」的時段預約需要讓路；已逾時的預約本身也會走這個流程
+        const blockingSlots = waitingList
+          .filter(x => x.type === '時段預約' && x.startMinutes + graceMin > nowMinutes)
+          .sort((a, b) => a.startMinutes - b.startMinutes);
+
+        const fitsBeforeNextSlot = (dur) =>
+          !blockingSlots.some(s => s.startMinutes < nowMinutes + dur && s.endMinutes > nowMinutes);
+
+        // 找第一位「現在就能用完、且名單中同學在其他機台沒有衝突」的排隊者
+        const substitute = queueList.find(q => {
+          const dur = q.durationMinutes || 20;
+          if (!fitsBeforeNextSlot(dur)) return false;
+          return !findStudentConflict(snapshot, q.students, q.email, nowMinutes, dur, q.id);
+        });
+
+        if (!substitute) return false;
+
+        // --- 替補者：立即叫號 ---
+        const subDur = substitute.durationMinutes || 20;
+        const subEnd = nowMinutes + subDur;
+        await supabaseClient.from('reservations').update({
+          status: '等候報到',
+          start_minutes: nowMinutes,
+          end_minutes: subEnd,
+          start_time_formatted: minutesToTime(nowMinutes),
+          end_time_formatted: minutesToTime(subEnd),
+          called_at: new Date().toISOString(),
+          advance_offered_at: null
+        }).eq('id', substitute.id);
+
+        sendQueueCallNotification({
+          studentNames: substitute.students.join(', '),
+          machineName: substitute.machineName,
+          startTime: minutesToTime(nowMinutes),
+          endTime: minutesToTime(subEnd),
+          durationMinutes: subDur,
+          toEmail: substitute.email || ''
+        });
+
+        // --- 逾時者轉為現場排隊，排在替補者正後方；其餘排隊者依序往後並避開時段預約 ---
+        const restQueue = [overdue, ...queueList.filter(q => q.id !== substitute.id)];
+        let runningStart = subEnd;
+        let overdueNewStart = subEnd;
+        for (const item of restQueue) {
+          const dur = item.durationMinutes || 20;
+          let candStart = runningStart;
+          for (const slot of blockingSlots) {
+            if (candStart < slot.endMinutes && candStart + dur > slot.startMinutes) {
+              candStart = Math.max(candStart, slot.endMinutes);
+            }
+          }
+
+          const payload = {
+            status: '排隊中',
+            start_minutes: candStart,
+            end_minutes: candStart + dur,
+            start_time_formatted: minutesToTime(candStart),
+            end_time_formatted: minutesToTime(candStart + dur),
+            called_at: null
+          };
+          if (item.id === overdue.id) {
+            // NOTE: 時段預約逾時後就失去固定時段，改以現場排隊身分順延，後續沿用排隊叫號流程
+            payload.type = '現場排隊';
+            payload.advance_offered_at = null;
+            payload.notes = '逾時未報到，已順延至下一位之後';
+            overdueNewStart = candStart;
+          }
+          await supabaseClient.from('reservations').update(payload).eq('id', item.id);
+          runningStart = candStart + dur;
+        }
+
+        await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', overdue.machineId);
+
+        const stamp = new Date().toLocaleTimeString('zh-TW');
+        setNotifications(prev => [
+          {
+            id: `N_${Date.now()}_sub`,
+            timestamp: stamp,
+            recipientName: substitute.students.join(', '),
+            machineName: substitute.machineName,
+            subject: '【叫號通知】輪到您使用機台了！',
+            body: `親愛的 ${substitute.students.join(', ')} 同學：前一位同學逾時未報到，【${substitute.machineName}】改由您先使用，時段為 ${minutesToTime(nowMinutes)} ～ ${minutesToTime(subEnd)}，請於 ${graceMin} 分鐘內前往報到！`
+          },
+          {
+            id: `N_${Date.now()}_ovd`,
+            timestamp: stamp,
+            recipientName: overdue.students.join(', '),
+            machineName: overdue.machineName,
+            subject: '【順延通知】逾時未報到，已順延',
+            body: `親愛的 ${overdue.students.join(', ')} 同學：您在【${overdue.machineName}】超過 ${graceMin} 分鐘未報到，已先讓下一位同學使用，您的時段順延至約 ${minutesToTime(overdueNewStart)} 開始。`
+          },
+          ...prev
+        ]);
+
+        return true;
+      };
+
+      // NOTE: 自動逾時掃描機制（每 8 秒自動輪詢）
+      // 1. 現場排隊叫號逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留）
       // 2. 時段預約提前詢問 3 分鐘未回應 ➔ 保留原時段、叫下一位
-      // 3. 時段預約開始後 3 分鐘未報到 ➔ 自動取消該時段，釋出給現場排隊遞補
+      // 3. 時段預約開始後逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留）
       useEffect(() => {
         const scanTimeout = async () => {
           if (!supabaseClient || isCoursePaused || reservations.length === 0) return;
@@ -842,30 +963,18 @@
 
           let updatedAny = false;
           const machinesToAdvance = new Set();
+          // NOTE: 同一輪掃描每台機台最多做一次替補調換，避免用過期的快照重複改動
+          const swappedMachines = new Set();
 
           for (const r of reservations) {
-            // 規則 1: 現場排隊等候報到 逾時 3 分鐘未開始使用 -> 自動過號
-            if (r.type === '現場排隊' && r.status === '等候報到') {
-              if (r.calledAt) {
-                const calledTime = new Date(r.calledAt).getTime();
-                if (now.getTime() - calledTime >= graceMs) {
-                  console.log(`[Auto-Skip] 現場排隊叫號逾時 3 分鐘未報到：${r.id} (${r.students.join(', ')})`);
-                  await supabaseClient.from('reservations').update({
-                    status: '未報到',
-                    cancelled_at: now.toISOString()
-                  }).eq('id', r.id);
-
-                  const notif = {
-                    id: `N_${Date.now()}`,
-                    timestamp: now.toLocaleTimeString('zh-TW'),
-                    recipientName: r.students.join(', '),
-                    machineName: r.machineName,
-                    subject: '【過號通知】排隊叫號逾時未報到',
-                    body: `親愛的 ${r.students.join(', ')} 同學：您排隊的【${r.machineName}】因超過 ${graceMin} 分鐘未報到，系統已自動跳過並叫號下一位同學。`
-                  };
-                  setNotifications(prev => [notif, ...prev]);
-
-                  machinesToAdvance.add(r.machineId);
+            // 規則 1: 現場排隊等候報到逾時 -> 有人可替補就順延，沒有就保留資格
+            if (r.type === '現場排隊' && r.status === '等候報到' && r.calledAt) {
+              const calledTime = new Date(r.calledAt).getTime();
+              if (now.getTime() - calledTime >= graceMs && !swappedMachines.has(r.machineId)) {
+                const swapped = await handleOverdueReservation(r, reservations, currentMin, graceMin);
+                if (swapped) {
+                  console.log(`[Overdue-Swap] 現場排隊叫號逾時，已由下一位替補：${r.id}`);
+                  swappedMachines.add(r.machineId);
                   updatedAny = true;
                 }
               }
@@ -899,33 +1008,22 @@
               }
             }
 
-            // 規則 3: 時段預約到達原本預約時間後，超過 3 分鐘未開始使用 -> 自動取消該時段
+            // 規則 3: 時段預約超過開始時間仍未報到 -> 有人可替補就順延，沒有就保留資格
             if (r.type === '時段預約' && (r.status === '排隊中' || r.status === '等候報到')) {
-              if (currentMin >= r.startMinutes + graceMin) {
-                console.log(`[Auto-Cancel] 時段預約逾時未報到：${r.id} (${r.students.join(', ')})`);
-                await supabaseClient.from('reservations').update({
-                  status: '未報到',
-                  cancelled_at: now.toISOString()
-                }).eq('id', r.id);
-
-                const notif = {
-                  id: `N_${Date.now()}`,
-                  timestamp: now.toLocaleTimeString('zh-TW'),
-                  recipientName: r.students.join(', '),
-                  machineName: r.machineName,
-                  subject: '【預約逾時取消】時段逾時未報到',
-                  body: `親愛的 ${r.students.join(', ')} 同學：您預約的【${r.machineName}】（時段 ${r.startTimeFormatted} ～ ${r.endTimeFormatted}）因超過開始時間 ${graceMin} 分鐘未報到，系統已自動取消該時段，釋出給現場排隊同學。`
-                };
-                setNotifications(prev => [notif, ...prev]);
-
-                machinesToAdvance.add(r.machineId);
-                updatedAny = true;
+              if (currentMin >= r.startMinutes + graceMin && !swappedMachines.has(r.machineId)) {
+                const swapped = await handleOverdueReservation(r, reservations, currentMin, graceMin);
+                if (swapped) {
+                  console.log(`[Overdue-Swap] 時段預約逾時，已由排隊者替補：${r.id}`);
+                  swappedMachines.add(r.machineId);
+                  updatedAny = true;
+                }
               }
             }
           }
 
-          // 對有變動的機台推進隊列
+          // 對有變動的機台推進隊列（已做過替補調換的機台隊列已重排，不再重複推進）
           for (const macId of machinesToAdvance) {
+            if (swappedMachines.has(macId)) continue;
             await advanceQueueForMachine(macId);
           }
 
