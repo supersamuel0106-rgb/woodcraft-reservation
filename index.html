@@ -829,10 +829,12 @@
 
         if (nextCandidate.type === '現場排隊') {
           // --- Case A: 現場排隊 ➔ 直接叫號 (3 分鐘報到緩衝) ---
+          // 將選定的無衝突候補者置於首位，其餘同學依序排列
+          const sortedQueue = [nextCandidate, ...queueList.filter(q => q.id !== nextCandidate.id)];
           let runningStartMin = nowMinutes;
 
-          for (let i = 0; i < queueList.length; i++) {
-            const item = queueList[i];
+          for (let i = 0; i < sortedQueue.length; i++) {
+            const item = sortedQueue[i];
             const isFirst = i === 0;
             const newStatus = isFirst ? '等候報到' : '排隊中';
 
@@ -1383,6 +1385,16 @@
         }
 
         await refreshData();
+
+        // NOTE: 若新增的是現場排隊，且機台當前無人使用，立即推進叫號並更新機台狀態
+        if (data.type === '現場排隊') {
+          const inUse = reservations.find(r => r.machineId === data.machineId && r.status === '使用中');
+          if (!inUse) {
+            await advanceQueueForMachine(data.machineId);
+            await refreshData();
+          }
+        }
+
         return {
           success: true,
           message: `成功建立【${data.type}】！預約時段：${minutesToTime(startMin)} ～ ${minutesToTime(endMin)}`
@@ -2180,6 +2192,19 @@
       const [selectedSlotId, setSelectedSlotId] = useState(minutesToTime(courseStartMin));
       const [isSubmitting, setIsSubmitting] = useState(false);
 
+      // NOTE: 確保登入者本人始終存在於名單首位
+      useEffect(() => {
+        if (activeUser?.name) {
+          setSelectedStudents(prev => {
+            const clean = prev.filter(Boolean);
+            if (!clean.includes(activeUser.name)) {
+              return [activeUser.name, ...clean];
+            }
+            return clean;
+          });
+        }
+      }, [activeUser?.name]);
+
       // NOTE: 最少 10 分鐘（1格），最多由學生人數決定（1人最多20分鐘，2人最多30分鐘...）
       const MIN_DURATION = 10;
       const maxDuration = calculateUsageMinutes(selectedStudents.length);
@@ -2233,8 +2258,11 @@
       }, [phaseInfo.phase]);
 
       const toggleStudent = (sName) => {
+        if (sName === activeUser?.name) {
+          return; // 本人不可取消勾選
+        }
         if (selectedStudents.includes(sName)) {
-          // 取消勾選組員（本人不在此處取消）
+          // 取消勾選組員
           setSelectedStudents(prev => prev.filter(s => s !== sName));
         } else {
           // 勾選組員：最多只能勾選 4 人（連同本人共 5 人）
@@ -4061,17 +4089,20 @@
                       <span className="font-bold text-sm text-slate-900 shrink-0">
                         {getTitle()}
                       </span>
-                      <span className="text-[11px] text-slate-500 font-medium truncate">
-                        👤 {activeUser.name} ({activeUser.mail}) {isAdmin ? '👑 老師/助教' : '🎓 學生'}
+                      <span className="text-[11px] text-slate-500 font-medium truncate" title={`${activeUser.name} (${activeUser.mail})`}>
+                        👤 {activeUser.name}
+                      </span>
+                      <span className="shrink-0 text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded font-medium">
+                        {isAdmin ? '👑 老師/助教' : '🎓 學生'}
                       </span>
                     </div>
                   ) : (
                     <div className="text-xs text-slate-700 font-semibold whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1.5">
                       <span className="shrink-0">👤 {activeUser.name}</span>
-                      <span className="text-slate-400 text-[11px] truncate">({activeUser.mail})</span>
                       <span className="shrink-0 text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded font-medium">
                         {isAdmin ? '👑 老師/助教' : '🎓 學生'}
                       </span>
+                      <span className="text-slate-400 text-[11px] truncate hidden sm:inline" title={activeUser.mail}>({activeUser.mail})</span>
                     </div>
                   )}
                 </div>
