@@ -409,6 +409,43 @@
       });
     }
 
+    /**
+     * 判斷某筆預約/排隊「現在」是否可以按開始使用
+     * NOTE: 規則
+     * 1. 時段預約：必須已到預約開始時間才能開始（逾時仍保留資格者也可報到）
+     * 2. 現場排隊：只要前面沒有人（無人使用中、無更早排序的等候者），即可提早開始
+     * 兩者皆不可在機台有其他人使用中時開始
+     * @param target 欲開始的預約
+     * @param reservations 所有預約資料
+     * @param nowMinutes 目前時間（分鐘）
+     * @returns { canStart, reason }
+     */
+    function getStartEligibility(target, reservations, nowMinutes) {
+      const WAITING_STATUSES = ['等候報到', '等候提前確認', '排隊中', '等待中'];
+      const sameMachine = reservations.filter(r => r.machineId === target.machineId && r.id !== target.id);
+
+      const inUse = sameMachine.find(r => r.status === '使用中');
+      if (inUse) {
+        return { canStart: false, reason: `機台目前由【${(inUse.students || []).join(', ')}】使用中（預計 ${inUse.endTimeFormatted} 結束），請等候對方結束後再開始。` };
+      }
+
+      if (target.type === '時段預約') {
+        if (nowMinutes < target.startMinutes) {
+          return { canStart: false, reason: `尚未到預約時段！您的時段為 ${target.startTimeFormatted} ～ ${target.endTimeFormatted}，請於時段開始後再按開始。` };
+        }
+        return { canStart: true, reason: '' };
+      }
+
+      // 現場排隊：排序在自己之前、仍在等候的人都算「前面有人」
+      const ahead = sameMachine
+        .filter(r => WAITING_STATUSES.includes(r.status) && r.startMinutes < target.startMinutes)
+        .sort((a, b) => a.startMinutes - b.startMinutes)[0];
+      if (ahead) {
+        return { canStart: false, reason: `前面還有【${(ahead.students || []).join(', ')}】（${ahead.startTimeFormatted} ～ ${ahead.endTimeFormatted}）尚未使用，請依順序等候叫號。` };
+      }
+      return { canStart: true, reason: '' };
+    }
+
     // 計算現場排隊即時起始時間（推算目前機台最早可接續的時間點，若有任何衝突自動往後推至最早可用時段）
     function calculateDynamicQueueStart(reservations, machineId, durationMin = 20, courseEndMin = 1020, students = [], userEmail = '') {
       const now = new Date();
@@ -1242,7 +1279,13 @@
         };
       };
 
-      const startMachineUsage = async (machineId, reservationId) => {
+      /**
+       * 開始使用機台（報到）
+       * @param machineId 機台 ID
+       * @param reservationId 預約 ID
+       * @param force 管理員強制開始，略過時段/順序檢查（現場特殊狀況用）
+       */
+      const startMachineUsage = async (machineId, reservationId, force = false) => {
         if (isCoursePaused) {
           alert('⚠️ 目前課程暫停（老師講解中），機台暫停使用！請待老師恢復課程後再報到使用。');
           return;
@@ -1262,6 +1305,16 @@
           const realMacId = targetRes.machineId || machineId;
           const now = new Date();
           const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+          // NOTE: 前端按鈕已會停用，這裡再擋一次，避免舊畫面或重複點擊繞過規則
+          if (!force) {
+            const eligibility = getStartEligibility(targetRes, reservations, nowMinutes);
+            if (!eligibility.canStart) {
+              alert(`⚠️ 目前無法開始使用\n\n${eligibility.reason}`);
+              return;
+            }
+          }
+
           const newEndMinutes = nowMinutes + targetRes.durationMinutes;
 
           await supabaseClient.from('reservations').update({
@@ -2566,6 +2619,8 @@
             myRes.map(res => {
               const finished = res.status === '已完成' || res.status === '已取消';
               const isInUse = res.status === '使用中';
+              const nowDate = new Date();
+              const eligibility = getStartEligibility(res, reservations, nowDate.getHours() * 60 + nowDate.getMinutes());
 
               return (
                 <div key={res.id} className={`bg-white rounded-2xl p-5 shadow-xs border flex flex-col justify-between space-y-3 ${isInUse ? 'border-red-200 ring-1 ring-red-100 bg-red-50/10' : 'border-slate-200'}`}>
@@ -2595,9 +2650,16 @@
 
                       {!isInUse ? (
                         <button
-                          onClick={() => startMachineUsage(res.machineId, res.id)}
-                          className="w-10 h-10 rounded-full bg-slate-900 text-white flex items-center justify-center hover:bg-slate-800 shadow-md transition-transform active:scale-95"
-                          title="開始使用 (立即報到)"
+                          onClick={() => {
+                            // NOTE: 不用 disabled，讓同學點了能看到「為什麼還不能開始」
+                            if (!eligibility.canStart) {
+                              alert(`⚠️ 目前無法開始使用\n\n${eligibility.reason}`);
+                              return;
+                            }
+                            startMachineUsage(res.machineId, res.id);
+                          }}
+                          className={`w-10 h-10 rounded-full flex items-center justify-center shadow-md transition-transform active:scale-95 ${eligibility.canStart ? 'bg-slate-900 text-white hover:bg-slate-800' : 'bg-slate-200 text-slate-400 cursor-not-allowed shadow-none'}`}
+                          title={eligibility.canStart ? '開始使用 (立即報到)' : eligibility.reason}
                         >
                           ▶
                         </button>
@@ -3005,8 +3067,14 @@
                                       <button
                                         type="button"
                                         onClick={() => {
-                                          if (window.confirm(`確定將【${res.students.join(', ')}】設為開始使用機台嗎？`)) {
-                                            startMachineUsage(res.machineId, res.id);
+                                          const nd = new Date();
+                                          const elig = getStartEligibility(res, reservations, nd.getHours() * 60 + nd.getMinutes());
+                                          // NOTE: 管理員可強制開始，但未符合規則時要明確提醒
+                                          const msg = elig.canStart
+                                            ? `確定將【${res.students.join(', ')}】設為開始使用機台嗎？`
+                                            : `⚠️ 依規則目前不可開始：\n${elig.reason}\n\n確定要以管理員身分強制將【${res.students.join(', ')}】設為開始使用嗎？`;
+                                          if (window.confirm(msg)) {
+                                            startMachineUsage(res.machineId, res.id, true);
                                           }
                                         }}
                                         className="py-1.5 px-2.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 active:scale-95 shadow-xs cursor-pointer"
