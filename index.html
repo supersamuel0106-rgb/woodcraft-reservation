@@ -59,7 +59,7 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useCallback, useMemo, createContext, useContext } = React;
+    const { useState, useEffect, useCallback, useMemo, useRef, createContext, useContext } = React;
 
     // ============================================================
     // 1. Supabase 連線設定
@@ -4152,7 +4152,7 @@
 
       // 若非管理員且當前在管理頁面，自動切回機台列表
       useEffect(() => {
-        if (!isAdmin && (activeTab === 'admin_control' || activeTab === 'courses' || activeTab === 'settings')) {
+        if (!isAdmin && (activeTab === 'courses' || activeTab === 'settings')) {
           setActiveTab('machines');
         }
       }, [isAdmin, activeTab, setActiveTab]);
@@ -4187,7 +4187,6 @@
         if (activeTab === 'machines') {
           return ''; // 機台列表與機台詳情頁面不顯示重複標題
         }
-        if (activeTab === 'admin_control') return '管理控制';
         if (activeTab === 'reservations') return '我的預約';
         if (activeTab === 'courses') return '課程場次';
         if (activeTab === 'settings') return '預約設定';
@@ -4319,9 +4318,6 @@
                 )
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
-              {isAdmin && activeTab === 'admin_control' && (
-                <AdminReservationsOverviewView onOpenReservationModal={(id) => openModal(id)} />
-              )}
               {isAdmin && activeTab === 'courses' && (
                 <CourseSessionsView onOpenReservationModal={(id) => openModal(id)} />
               )}
@@ -4332,9 +4328,6 @@
             <div className="h-16 bg-white border-t border-slate-200 flex items-center justify-around z-20 select-none shadow-lg">
               {[
                 { id: 'machines', label: '機台列表', icon: '🪚' },
-                ...(isAdmin ? [
-                  { id: 'admin_control', label: '管理控制', icon: '👑' }
-                ] : []),
                 { id: 'reservations', label: '我的預約', icon: '📋' },
                 ...(isAdmin ? [
                   { id: 'courses', label: '課程場次', icon: '📚' },
