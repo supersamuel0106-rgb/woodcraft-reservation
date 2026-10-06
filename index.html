@@ -2650,7 +2650,17 @@
     // 7b. 機台詳情頁 (MachineDetailView) - 顯示排隊清單 + 最快可用時段 + 新增預約
     // ============================================================
     function MachineDetailView({ machine, onBack, onOpenReservationModal }) {
-      const { reservations, systemSettings } = useApp();
+      const { 
+        reservations, 
+        systemSettings, 
+        activeUser,
+        reorderMachineQueue,
+        shiftReservationTime,
+        startMachineUsage,
+        finishMachineUsage,
+        cancelReservation
+      } = useApp();
+      const isAdmin = isTeacherOrTA(activeUser);
 
       // 檢查是否為當天日期（隔天自動清除歷史紀錄）
       const isToday = (dateStr) => {
@@ -2877,6 +2887,32 @@
               </div>
             )}
           </div>
+
+          {/* 👑 管理者/助教專屬即時控制面板 */}
+          {isAdmin && (
+            <div className="space-y-2 pt-2">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-xs font-black text-indigo-900 flex items-center gap-1.5">
+                  <span>👑</span>
+                  <span>助教專屬即時調控面板（可拖曳排程）</span>
+                </span>
+                <span className="text-[10px] bg-indigo-100 text-indigo-800 font-bold px-2 py-0.5 rounded-full">
+                  管理者模式
+                </span>
+              </div>
+              <AdminMachineQueueCard
+                mac={machine}
+                allReservations={reservations}
+                filterStatus="ALL"
+                onReorder={reorderMachineQueue}
+                onShift={shiftReservationTime}
+                onStart={startMachineUsage}
+                onFinish={finishMachineUsage}
+                onCancel={cancelReservation}
+                onOpenReservationModal={onOpenReservationModal}
+              />
+            </div>
+          )}
         </div>
       );
     }
@@ -3011,7 +3047,7 @@
     // ============================================================
     // 9. 課程場次 (CourseSessionsView) - 支援課程暫停計時與時段順延控制
     // ============================================================
-    function CourseSessionsView() {
+    function CourseSessionsView({ onOpenReservationModal }) {
       const { courseSessions, setCurrentCourseSession, isCoursePaused, coursePausedAt, pauseCourse, resumeCourse } = useApp();
       const [isProcessing, setIsProcessing] = useState(false);
       const [elapsedSec, setElapsedSec] = useState(0);
@@ -3064,7 +3100,7 @@
 
       // 若切換至管理者全機台預約總覽頁面
       if (showAdminOverview) {
-        return <AdminReservationsOverviewView onBack={() => setShowAdminOverview(false)} />;
+        return <AdminReservationsOverviewView onBack={() => setShowAdminOverview(false)} onOpenReservationModal={onOpenReservationModal} />;
       }
 
       return (
@@ -3207,18 +3243,19 @@
       onShift,
       onStart,
       onFinish,
-      onCancel
+      onCancel,
+      onOpenReservationModal
     }) {
       const sortableRef = useRef(null);
       const sortableInst = useRef(null);
       const [isUpdating, setIsUpdating] = useState(false);
 
-      // 分類該機台的預約
+      // 分類該機台的預約 (相容各種機台 ID 與名稱比對)
       const macAll = useMemo(() => {
         return allReservations
-          .filter(r => r.machineId === mac.id)
+          .filter(r => r.machineId === mac.id || r.machineName === mac.name || (mac.name && r.machineId && mac.name.includes(r.machineId)))
           .sort((a, b) => a.startMinutes - b.startMinutes);
-      }, [allReservations, mac.id]);
+      }, [allReservations, mac.id, mac.name]);
 
       const inUseRes = useMemo(() => {
         return macAll.find(r => r.status === '使用中');
@@ -3339,21 +3376,50 @@
               </div>
             </div>
 
-            <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
-              mac.status === '使用中' 
-                ? 'bg-red-50 text-red-700 border-red-200 animate-pulse' 
-                : mac.status === '等待報到' 
-                ? 'bg-amber-50 text-amber-700 border-amber-200' 
-                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-            }`}>
-              {mac.status === '使用中' ? '🔴 使用中' : mac.status === '等待報到' ? '🟡 等待報到' : '🟢 空閒'}
-            </span>
+            <div className="flex items-center gap-2">
+              {onOpenReservationModal && (
+                <button
+                  type="button"
+                  onClick={() => onOpenReservationModal(mac.id)}
+                  className="py-1 px-2.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 text-[11px] font-bold border border-blue-200 transition-colors cursor-pointer active:scale-95 flex items-center gap-1 shadow-2xs"
+                  title="為此機台新增預約或排隊"
+                >
+                  <span>＋</span>
+                  <span>新增排隊</span>
+                </button>
+              )}
+              <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+                mac.status === '使用中' 
+                  ? 'bg-red-50 text-red-700 border-red-200 animate-pulse' 
+                  : mac.status === '等待報到' 
+                  ? 'bg-amber-50 text-amber-700 border-amber-200' 
+                  : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+              }`}>
+                {mac.status === '使用中' ? '🔴 使用中' : mac.status === '等待報到' ? '🟡 等待報到' : '🟢 空閒'}
+              </span>
+            </div>
           </div>
 
-          {/* 總體無預約 */}
+          {/* 總體無預約時的清晰空狀態與操作提示 */}
           {totalVisible === 0 ? (
-            <div className="p-6 text-center text-xs text-slate-400 font-semibold">
-              📭 目前無符合此篩選條件的預約紀錄
+            <div className="p-6 text-center space-y-2.5 bg-slate-50/50">
+              <div className="text-2xl">🟢</div>
+              <div className="space-y-0.5">
+                <p className="text-xs font-bold text-slate-700">目前本機台尚無排隊或預約記錄</p>
+                <p className="text-[11px] text-slate-400">機台處於空閒狀態，同學可直接至現場報到使用</p>
+              </div>
+              {onOpenReservationModal && (
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => onOpenReservationModal(mac.id)}
+                    className="inline-flex items-center gap-1 py-1.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold shadow-xs transition-all cursor-pointer"
+                  >
+                    <span>＋</span>
+                    <span>幫同學加入排隊 / 預約</span>
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="divide-y divide-slate-100">
@@ -3582,7 +3648,7 @@
     // 9.5 管理者預約總覽 (AdminReservationsOverviewView)
     // 依機台順序展示全班所有預約場次、排隊與狀態
     // ============================================================
-    function AdminReservationsOverviewView({ onBack }) {
+    function AdminReservationsOverviewView({ onBack, onOpenReservationModal }) {
       const { 
         machines, 
         reservations, 
@@ -3590,31 +3656,78 @@
         finishMachineUsage, 
         cancelReservation,
         reorderMachineQueue,
-        shiftReservationTime
+        shiftReservationTime,
+        refreshData
       } = useApp();
       const [filterStatus, setFilterStatus] = useState('ALL'); // 'ALL', 'ACTIVE', 'COMPLETED', 'CANCELLED'
+      const [selectedMacFilter, setSelectedMacFilter] = useState('ALL'); // 'ALL' or specific machine id
+      const [isRefreshing, setIsRefreshing] = useState(false);
+
+      const handleRefresh = async () => {
+        setIsRefreshing(true);
+        try {
+          await refreshData();
+        } finally {
+          setTimeout(() => setIsRefreshing(false), 500);
+        }
+      };
 
       // 統計數據
       const totalCount = reservations.length;
       const inUseCount = reservations.filter(r => r.status === '使用中').length;
       const waitingCount = reservations.filter(r => r.status === '等候報到' || r.status === '排隊中').length;
 
+      // 篩選展示的機台
+      const displayedMachines = useMemo(() => {
+        if (selectedMacFilter === 'ALL') return machines;
+        return machines.filter(m => m.id === selectedMacFilter);
+      }, [machines, selectedMacFilter]);
+
       return (
         <div className="space-y-4">
-          {/* 返回與標題列 */}
-          <div className="bg-white rounded-3xl p-4 shadow-xs border border-slate-200 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={onBack}
-              className="flex items-center gap-1.5 text-xs font-bold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-xl transition-all active:scale-95 cursor-pointer"
-            >
-              <span>←</span>
-              <span>返回課程場次</span>
-            </button>
-            <div className="text-right">
-              <span className="text-[10px] font-bold bg-blue-100 text-blue-800 px-2.5 py-1 rounded-full border border-blue-200">
-                👑 全機台預約管理總覽
-              </span>
+          {/* 頂部標題與主操作列 */}
+          <div className="bg-white rounded-3xl p-4 shadow-xs border border-slate-200 flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2">
+              {onBack && (
+                <button
+                  type="button"
+                  onClick={onBack}
+                  className="flex items-center gap-1.5 text-xs font-bold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-xl transition-all active:scale-95 cursor-pointer shrink-0"
+                >
+                  <span>←</span>
+                  <span>返回</span>
+                </button>
+              )}
+              <div>
+                <h3 className="text-sm font-black text-slate-900 flex items-center gap-1.5">
+                  <span>👑</span>
+                  <span>全機台排隊與調控中心</span>
+                </h3>
+                <p className="text-[10px] text-slate-400 font-medium">拖曳調整順序 • 手動順延/提前 • 強制開機報到</p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleRefresh}
+                disabled={isRefreshing}
+                className="p-2 rounded-xl bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-600 border border-slate-200 transition-all cursor-pointer active:scale-95 shadow-2xs"
+                title="重新整理資料"
+              >
+                <span className={`inline-block ${isRefreshing ? 'animate-spin' : ''}`}>🔄</span>
+              </button>
+
+              {onOpenReservationModal && (
+                <button
+                  type="button"
+                  onClick={() => onOpenReservationModal(machines[0]?.id)}
+                  className="py-2 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-md shadow-blue-500/20 active:scale-95 transition-all cursor-pointer flex items-center gap-1 shrink-0"
+                >
+                  <span>＋</span>
+                  <span>幫同學新增預約</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -3634,30 +3747,46 @@
             </div>
           </div>
 
-          {/* 狀態過濾按鈕組 */}
-          <div className="grid grid-cols-4 bg-slate-200/80 p-1 rounded-2xl text-[11px] font-bold">
-            {[
-              { id: 'ALL', label: '全部' },
-              { id: 'ACTIVE', label: '進行中' },
-              { id: 'COMPLETED', label: '已完成' },
-              { id: 'CANCELLED', label: '已取消' }
-            ].map(f => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setFilterStatus(f.id)}
-                className={`py-1.5 rounded-xl transition-all cursor-pointer ${
-                  filterStatus === f.id ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
+          {/* 機台篩選選單與狀態過濾列 */}
+          <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-xs space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-bold text-slate-700 shrink-0">篩選機台：</span>
+              <select
+                value={selectedMacFilter}
+                onChange={e => setSelectedMacFilter(e.target.value)}
+                className="flex-1 bg-slate-50 border border-slate-300 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none focus:border-blue-500"
               >
-                {f.label}
-              </button>
-            ))}
+                <option value="ALL">全部 14 台機台（完整清單）</option>
+                {machines.map(m => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-4 bg-slate-100 p-1 rounded-xl text-[11px] font-bold">
+              {[
+                { id: 'ALL', label: '全部' },
+                { id: 'ACTIVE', label: '進行中' },
+                { id: 'COMPLETED', label: '已完成' },
+                { id: 'CANCELLED', label: '已取消' }
+              ].map(f => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setFilterStatus(f.id)}
+                  className={`py-1.5 rounded-lg transition-all cursor-pointer ${
+                    filterStatus === f.id ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* 依機台順序排列的清單 (每個機台各自支援拖曳排序與手動微調) */}
           <div className="space-y-4">
-            {machines.map(mac => (
+            {displayedMachines.map(mac => (
               <AdminMachineQueueCard
                 key={mac.id}
                 mac={mac}
@@ -3668,6 +3797,7 @@
                 onStart={startMachineUsage}
                 onFinish={finishMachineUsage}
                 onCancel={cancelReservation}
+                onOpenReservationModal={onOpenReservationModal}
               />
             ))}
           </div>
@@ -4022,7 +4152,7 @@
 
       // 若非管理員且當前在管理頁面，自動切回機台列表
       useEffect(() => {
-        if (!isAdmin && (activeTab === 'courses' || activeTab === 'settings')) {
+        if (!isAdmin && (activeTab === 'admin_control' || activeTab === 'courses' || activeTab === 'settings')) {
           setActiveTab('machines');
         }
       }, [isAdmin, activeTab, setActiveTab]);
@@ -4057,6 +4187,7 @@
         if (activeTab === 'machines') {
           return ''; // 機台列表與機台詳情頁面不顯示重複標題
         }
+        if (activeTab === 'admin_control') return '管理控制';
         if (activeTab === 'reservations') return '我的預約';
         if (activeTab === 'courses') return '課程場次';
         if (activeTab === 'settings') return '預約設定';
@@ -4188,7 +4319,12 @@
                 )
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
-              {isAdmin && activeTab === 'courses' && <CourseSessionsView />}
+              {isAdmin && activeTab === 'admin_control' && (
+                <AdminReservationsOverviewView onOpenReservationModal={(id) => openModal(id)} />
+              )}
+              {isAdmin && activeTab === 'courses' && (
+                <CourseSessionsView onOpenReservationModal={(id) => openModal(id)} />
+              )}
               {isAdmin && activeTab === 'settings' && <BookingSettingsView />}
             </div>
 
@@ -4196,6 +4332,9 @@
             <div className="h-16 bg-white border-t border-slate-200 flex items-center justify-around z-20 select-none shadow-lg">
               {[
                 { id: 'machines', label: '機台列表', icon: '🪚' },
+                ...(isAdmin ? [
+                  { id: 'admin_control', label: '管理控制', icon: '👑' }
+                ] : []),
                 { id: 'reservations', label: '我的預約', icon: '📋' },
                 ...(isAdmin ? [
                   { id: 'courses', label: '課程場次', icon: '📚' },
