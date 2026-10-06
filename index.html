@@ -2652,15 +2652,8 @@
     function MachineDetailView({ machine, onBack, onOpenReservationModal }) {
       const { 
         reservations, 
-        systemSettings, 
-        activeUser,
-        reorderMachineQueue,
-        shiftReservationTime,
-        startMachineUsage,
-        finishMachineUsage,
-        cancelReservation
+        systemSettings
       } = useApp();
-      const isAdmin = isTeacherOrTA(activeUser);
 
       // 檢查是否為當天日期（隔天自動清除歷史紀錄）
       const isToday = (dateStr) => {
@@ -2887,32 +2880,6 @@
               </div>
             )}
           </div>
-
-          {/* 👑 管理者/助教專屬即時控制面板 */}
-          {isAdmin && (
-            <div className="space-y-2 pt-2">
-              <div className="flex items-center justify-between px-1">
-                <span className="text-xs font-black text-indigo-900 flex items-center gap-1.5">
-                  <span>👑</span>
-                  <span>助教專屬即時調控面板（可拖曳排程）</span>
-                </span>
-                <span className="text-[10px] bg-indigo-100 text-indigo-800 font-bold px-2 py-0.5 rounded-full">
-                  管理者模式
-                </span>
-              </div>
-              <AdminMachineQueueCard
-                mac={machine}
-                allReservations={reservations}
-                filterStatus="ALL"
-                onReorder={reorderMachineQueue}
-                onShift={shiftReservationTime}
-                onStart={startMachineUsage}
-                onFinish={finishMachineUsage}
-                onCancel={cancelReservation}
-                onOpenReservationModal={onOpenReservationModal}
-              />
-            </div>
-          )}
         </div>
       );
     }
