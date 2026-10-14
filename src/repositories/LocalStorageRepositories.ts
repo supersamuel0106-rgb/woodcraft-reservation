@@ -22,8 +22,8 @@ const STORAGE_KEYS = {
 const DEFAULT_MACHINES: Machine[] = [
   { id: '1. 角切機（makita）',        name: '1. 角切機（makita）',        status: '空閒' },
   { id: '2. 角切機（Bosch）',         name: '2. 角切機（Bosch）',         status: '空閒' },
-  { id: '3. 手壓鉋（外）',            name: '3. 手壓鉋（外）',            status: '空閒' },
-  { id: '4. 手壓鉋（內）',            name: '4. 手壓鉋（內）',            status: '空閒' },
+  { id: '3. 手壓鉋（外）',            name: '3. 手壓鉋（1）',            status: '空閒' },
+  { id: '4. 手壓鉋（內）',            name: '4. 手壓鉋（2）',            status: '空閒' },
   { id: '5. 自動鉋（外）',            name: '5. 自動鉋（外）',            status: '空閒' },
   { id: '6. 自動鉋（內）',            name: '6. 自動鉋（內）',            status: '空閒' },
   { id: '7. 圓鋸機',                  name: '7. 圓鋸機',                  status: '空閒' },

@@ -449,6 +449,46 @@
       return { canStart: true, reason: '' };
     }
 
+    // NOTE: 前一位提早結束在此分鐘數以內，後一位仍可使用到原訂結束時間（多得到一點時間）
+    const EARLY_FINISH_BONUS_LIMIT_MINUTES = 10;
+
+    /**
+     * 計算某筆預約「實際開始使用」時的結束時間
+     * NOTE: 規則
+     * 1. 準時（或在報到緩衝內稍晚）開始：緩衝時間 + 使用時間總共不能超過原訂結束時間，
+     *    因此結束時間 = 原訂結束時間（遲到的部分從使用時間內扣除）
+     * 2. 提早開始（前一位提早結束）：只要比原訂開始提早 10 分鐘以內，
+     *    仍可使用到原訂結束時間（等於多得到提早的那幾分鐘）
+     * 3. 提早超過 10 分鐘（很早就空出），或原訂時段已整段過去：
+     *    從現在起算完整使用時長，避免多佔後面同學的時段
+     * @param target 欲開始的預約（startMinutes / endMinutes 為目前排定的原訂時段）
+     * @param nowMinutes 目前時間（分鐘）
+     * @returns 實際結束時間（分鐘）
+     */
+    function calculateUsageEndMinutes(target, nowMinutes) {
+      const duration = target.durationMinutes || (target.endMinutes - target.startMinutes);
+      const scheduledStart = target.startMinutes;
+      const scheduledEnd = target.endMinutes;
+
+      // NOTE: 現場排隊在叫號前的時間只是預估（前面的人超時就會過時），
+      // 只有已被叫號（等候報到，時段是叫號當下重算的）才套用原訂結束時間
+      if (target.type === '現場排隊' && target.status !== '等候報到') {
+        return nowMinutes + duration;
+      }
+
+      // 原訂時段已整段過去，沒有可沿用的結束時間
+      if (nowMinutes >= scheduledEnd) return nowMinutes + duration;
+
+      // 規則 1：準時或稍晚開始，不得超出原訂結束時間
+      if (nowMinutes >= scheduledStart) return scheduledEnd;
+
+      // 規則 2：提早 10 分鐘以內，仍可用到原訂結束時間
+      if (scheduledStart - nowMinutes <= EARLY_FINISH_BONUS_LIMIT_MINUTES) return scheduledEnd;
+
+      // 規則 3：提早很多，維持完整時長
+      return nowMinutes + duration;
+    }
+
     /**
      * 重新計算機台隊列時間（用於助教拖曳調動順序）
      * NOTE: 核心規則
@@ -934,7 +974,8 @@
 
         const now = new Date();
         const nowMinutes = now.getHours() * 60 + now.getMinutes();
-        const newEnd = nowMinutes + target.durationMinutes;
+        // NOTE: 前一位提早 10 分鐘內結束，可使用到原訂結束時間；更早則維持完整時長
+        const newEnd = calculateUsageEndMinutes(target, nowMinutes);
 
         // 再次確認接受提前時是否有跨機台衝突
         const conflict = findStudentConflict(reservations, target.students, target.email, nowMinutes, target.durationMinutes, target.id);
@@ -1437,7 +1478,8 @@
             }
           }
 
-          const newEndMinutes = nowMinutes + targetRes.durationMinutes;
+          // NOTE: 依緩衝規則決定結束時間（準時不超出原訂結束；前一位提早 10 分鐘內仍可用到原訂結束）
+          const newEndMinutes = calculateUsageEndMinutes(targetRes, nowMinutes);
 
           await supabaseClient.from('reservations').update({
             status: '使用中',
