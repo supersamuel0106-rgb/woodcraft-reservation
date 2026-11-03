@@ -4239,6 +4239,60 @@
         .filter(Boolean);
     }
 
+    /**
+     * 「集合講課中」暫停畫面（電視版 / 手機版共用內容）
+     * @param variant 'tv' 使用 1920x1080 畫布尺寸；'mobile' 使用手機尺寸
+     * @param onDismiss 傳入時顯示「關閉此畫面」按鈕（僅供老師/助教，學生不傳）
+     */
+    function CoursePauseOverlay({ variant, onDismiss }) {
+      const isTv = variant === 'tv';
+      return (
+        <div
+          style={{
+            position: 'absolute', inset: 0, zIndex: 40,
+            // NOTE: 以毛玻璃模糊保留底下看板輪廓，與設計稿一致；舊瀏覽器不支援時退回半透明白底
+            background: 'rgba(245,245,245,0.55)',
+            backdropFilter: isTv ? 'blur(16px)' : 'blur(14px)',
+            WebkitBackdropFilter: isTv ? 'blur(16px)' : 'blur(14px)',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            textAlign: 'center', padding: isTv ? 60 : 24,
+            fontFamily: "'Noto Sans TC', 'Microsoft JhengHei', system-ui, sans-serif", color: '#111'
+          }}
+        >
+          <div style={{ fontSize: isTv ? 150 : 54, fontWeight: 900, letterSpacing: isTv ? 14 : 5, lineHeight: 1.1 }}>
+            集合講課中
+          </div>
+          <div
+            style={{
+              marginTop: isTv ? 36 : 18, padding: isTv ? '14px 90px' : '8px 28px', borderRadius: 999,
+              background: 'linear-gradient(180deg, #7CC8F8 0%, #4BAEEF 100%)', color: '#fff',
+              fontSize: isTv ? 52 : 20, fontWeight: 800, letterSpacing: isTv ? 4 : 2,
+              boxShadow: '0 6px 14px rgba(0,0,0,0.25)'
+            }}
+          >
+            所有機台計時已暫停
+          </div>
+          <div style={{ marginTop: isTv ? 150 : 56, fontSize: isTv ? 34 : 15, fontWeight: 600, lineHeight: 1.8, color: '#222' }}>
+            <div>請放下手邊工作，至大加工廠集合聽課</div>
+            <div>講課結束後將恢復計時，受影響的使用時段將會順延</div>
+          </div>
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              style={{
+                marginTop: isTv ? 50 : 32, padding: isTv ? '12px 28px' : '10px 20px', borderRadius: 12,
+                border: '1px solid #475569', background: '#fff', color: '#1e293b',
+                fontSize: isTv ? 24 : 14, fontWeight: 700, cursor: 'pointer'
+              }}
+            >
+              關閉此畫面（老師/助教）
+            </button>
+          )}
+        </div>
+      );
+    }
+
     function TvReservationBadge({ typeLabel }) {
       const isSlot = typeLabel === '預約';
       return (
@@ -4331,7 +4385,7 @@
     }
 
     function TvDisplayView({ onExit }) {
-      const { machines, reservations } = useApp();
+      const { machines, reservations, isCoursePaused } = useApp();
       const [now, setNow] = useState(() => new Date());
       const [scale, setScale] = useState(1);
       const [pageIndex, setPageIndex] = useState(0);
@@ -4561,6 +4615,9 @@
                 </div>
               </div>
             </div>
+
+            {/* 課程暫停時：電視版暫停畫面蓋在看板上方（退出看板按鈕 z-index 更高，仍可操作） */}
+            {isCoursePaused && <CoursePauseOverlay variant="tv" />}
           </div>
         </div>
       );
@@ -4588,6 +4645,9 @@
       const [isRefreshing, setIsRefreshing] = useState(false);
       // NOTE: 電視看板模式 —— 開啟後以全畫面覆蓋手機版面，退出後回到原本管理頁
       const [isTvMode, setIsTvMode] = useState(false);
+      // NOTE: 老師/助教可暫時關閉手機上的暫停畫面以操作控制介面；
+      //       以「暫停開始時間」為鍵，下一次新的暫停會再次顯示。學生無法關閉。
+      const [dismissedPauseKey, setDismissedPauseKey] = useState(null);
 
       // 動態取得最新的機台資料（避免在詳情頁時保留舊 snapshot）
       const currentSelectedMachine = selectedMachine 
@@ -4666,9 +4726,19 @@
         return '';
       };
 
+      const currentPauseKey = coursePausedAt || 'local';
+      const showPauseOverlay = isCoursePaused && !(isAdmin && dismissedPauseKey === currentPauseKey);
+
       return (
         <div className="min-h-screen bg-slate-900 py-0 sm:py-6 flex flex-col items-center justify-center">
           <div className="w-full max-w-sm sm:max-w-md h-screen sm:h-[840px] bg-slate-50 sm:rounded-[44px] sm:border-[10px] sm:border-slate-800 shadow-2xl overflow-hidden flex flex-col relative">
+            {/* 課程暫停：手機版「集合講課中」全屏畫面，學生不可關閉 */}
+            {showPauseOverlay && (
+              <CoursePauseOverlay
+                variant="mobile"
+                onDismiss={isAdmin ? () => setDismissedPauseKey(currentPauseKey) : undefined}
+              />
+            )}
             {/* 手機 App Header */}
             <div className="bg-white px-3.5 py-2.5 border-b border-slate-200 flex items-center justify-between shadow-2xs relative z-10">
               <div className="flex items-center gap-2 min-w-0 flex-1">
