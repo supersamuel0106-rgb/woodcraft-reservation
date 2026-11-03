@@ -3056,7 +3056,7 @@
     // ============================================================
     // 9. 課程場次 (CourseSessionsView) - 支援課程暫停計時與時段順延控制
     // ============================================================
-    function CourseSessionsView({ onOpenReservationModal }) {
+    function CourseSessionsView({ onOpenReservationModal, onOpenTvDisplay }) {
       const { courseSessions, setCurrentCourseSession, isCoursePaused, coursePausedAt, pauseCourse, resumeCourse } = useApp();
       const [isProcessing, setIsProcessing] = useState(false);
       const [elapsedSec, setElapsedSec] = useState(0);
@@ -3109,7 +3109,7 @@
 
       // 若切換至管理者全機台預約總覽頁面
       if (showAdminOverview) {
-        return <AdminReservationsOverviewView onBack={() => setShowAdminOverview(false)} onOpenReservationModal={onOpenReservationModal} />;
+        return <AdminReservationsOverviewView onBack={() => setShowAdminOverview(false)} onOpenReservationModal={onOpenReservationModal} onOpenTvDisplay={onOpenTvDisplay} />;
       }
 
       return (
@@ -3130,6 +3130,27 @@
                 className="py-2.5 px-3.5 rounded-2xl bg-white text-blue-700 hover:bg-blue-50 active:scale-95 text-xs font-bold shadow-sm transition-all flex items-center gap-1 shrink-0 cursor-pointer"
               >
                 <span>進入頁面</span>
+                <span>➔</span>
+              </button>
+            </div>
+          </div>
+
+          {/* NOTE: 老師/助教專用 —— 開啟現場大電視叫號看板（全螢幕顯示，可按 Esc 或右上角按鈕退出） */}
+          <div className="bg-gradient-to-r from-emerald-600 via-teal-600 to-teal-700 rounded-3xl p-5 text-white shadow-md">
+            <div className="flex items-center justify-between">
+              <div className="space-y-1">
+                <span className="inline-block bg-white/20 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
+                  📺 管理者專用功能
+                </span>
+                <h3 className="text-base font-bold text-white leading-tight">電視看板</h3>
+                <p className="text-[11px] text-emerald-100 font-medium">於現場大電視顯示各機台使用與叫號狀態</p>
+              </div>
+              <button
+                type="button"
+                onClick={onOpenTvDisplay}
+                className="py-2.5 px-3.5 rounded-2xl bg-white text-teal-700 hover:bg-emerald-50 active:scale-95 text-xs font-bold shadow-sm transition-all flex items-center gap-1 shrink-0 cursor-pointer"
+              >
+                <span>開啟看板</span>
                 <span>➔</span>
               </button>
             </div>
@@ -3656,7 +3677,7 @@
     // 9.5 管理者預約總覽 (AdminReservationsOverviewView)
     // 依機台順序展示全班所有預約場次、排隊與狀態
     // ============================================================
-    function AdminReservationsOverviewView({ onBack, onOpenReservationModal }) {
+    function AdminReservationsOverviewView({ onBack, onOpenReservationModal, onOpenTvDisplay }) {
       const { 
         machines, 
         reservations, 
@@ -3725,6 +3746,18 @@
               >
                 <span className={`inline-block ${isRefreshing ? 'animate-spin' : ''}`}>🔄</span>
               </button>
+
+              {onOpenTvDisplay && (
+                <button
+                  type="button"
+                  onClick={onOpenTvDisplay}
+                  className="py-2 px-3 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold shadow-md active:scale-95 transition-all cursor-pointer flex items-center gap-1 shrink-0"
+                  title="開啟現場電視看板"
+                >
+                  <span>📺</span>
+                  <span>電視看板</span>
+                </button>
+              )}
 
               {onOpenReservationModal && (
                 <button
@@ -4108,6 +4141,431 @@
     // ============================================================
     // 11. 主畫面排版 (MainLayout) - 純手機 App 排版 (Mobile-Only)
     // ============================================================
+    // ============================================================
+    // 12. 電視看板 (TvDisplayView) - 木工課現場大電視顯示機台叫號狀態
+    // ============================================================
+    // NOTE: 以 1920x1080 固定畫布設計，再依視窗大小等比縮放，
+    //       確保在任何 16:9 電視 / 螢幕上版面都與設計稿一致。
+    const TV_CANVAS_WIDTH = 1920;
+    const TV_CANVAS_HEIGHT = 1080;
+    const TV_QUEUE_PAGE_SIZE = 5;       // 報到清單每頁顯示筆數
+    const TV_QUEUE_ROTATE_MS = 6000;    // 報到清單自動換頁間隔
+    const TV_UPCOMING_STATUSES = ['等候報到', '等候提前確認', '排隊中', '等待中'];
+    const TV_THEME = {
+      idle:    { dot: '#4CAF50', bg: '#E8F6E4', border: '#5BAA5E' },
+      waiting: { dot: '#FFA45C', bg: '#FFE8D4', border: '#F2A25E' },
+      busy:    { dot: '#E5484D', bg: '#FFE5E7', border: '#D9545C' }
+    };
+
+    // NOTE: 看板版面依「機台類型」分欄（設計稿 4 欄 x 5 列），
+    //       同類型機台（手壓鉋 1/2、角切機 makita/Bosch…）需放在固定位置，
+    //       因此以「基礎名稱 + 區分條件」對應格位，而非單純依機台編號排序。
+    const TV_MACHINE_SLOTS = [
+      { base: '手壓鉋', digit: '1', col: 1, row: 1 },
+      { base: '角切機', text: 'makita', col: 1, row: 2 },
+      { base: '自動鉋', text: '手動', col: 1, row: 3 },
+      { base: '垂直鑽床', text: '無保護罩', col: 1, row: 4 },
+      { base: '水平鑽床', col: 1, row: 5 },
+      { base: '手壓鉋', digit: '2', col: 2, row: 1 },
+      { base: '角切機', text: 'bosch', col: 2, row: 2 },
+      { base: '自動鉋', text: '數位', col: 2, row: 3 },
+      { base: '垂直鑽床', text: '有保護罩', col: 2, row: 4 },
+      { base: '臥式花鉋機', col: 2, row: 5 },
+      { base: '圓鋸機', col: 3, row: 1 },
+      { base: '推台鋸', col: 3, row: 2 },
+      { base: '帶鋸機', col: 4, row: 1 },
+      { base: '落地式線鋸機', col: 4, row: 2 }
+    ];
+
+    /**
+     * 解析機台名稱，例如「5. 自動鉋2（數位）」→ { base: '自動鉋', digit: '2', note: '數位', tag: '02 數位' }
+     * @param rawName 資料庫中的機台名稱
+     * @returns 基礎名稱、編號、備註與看板上小標籤文字
+     */
+    function parseTvMachineName(rawName) {
+      const stripped = (rawName || '').replace(/^\s*\d+\s*[.．、]\s*/, '');
+      const noteMatch = stripped.match(/^(.*?)[（(]([^）)]*)[）)]\s*$/);
+      let base = noteMatch ? noteMatch[1].trim() : stripped.trim();
+      let note = noteMatch ? noteMatch[2].trim() : '';
+      let digit = '';
+
+      const trailingDigit = base.match(/^(.*?)(\d+)$/);
+      if (trailingDigit) {
+        base = trailingDigit[1].trim();
+        digit = String(parseInt(trailingDigit[2], 10));
+      } else if (/^\d+$/.test(note)) {
+        // 「手壓鉋（1）」的括號內是編號而非備註
+        digit = String(parseInt(note, 10));
+        note = '';
+      }
+
+      const tag = [digit ? digit.padStart(2, '0') : '', note].filter(Boolean).join(' ');
+      return { base, digit, note, tag };
+    }
+
+    /**
+     * 依 TV_MACHINE_SLOTS 將機台安排到看板格位
+     * 先以區分條件精準比對，剩餘空格再以同基礎名稱遞補（容錯資料庫命名差異）
+     */
+    function arrangeTvMachines(machines) {
+      const parsedList = machines.map(machine => ({ machine, parsed: parseTvMachineName(machine.name) }));
+      const used = new Set();
+      const assigned = new Array(TV_MACHINE_SLOTS.length).fill(null);
+
+      const matchesSlot = (slot, parsed) => {
+        if (parsed.base !== slot.base) return false;
+        if (slot.digit) return parsed.digit === slot.digit;
+        if (slot.text) return `${parsed.note} ${parsed.tag}`.toLowerCase().includes(slot.text.toLowerCase());
+        return true;
+      };
+
+      TV_MACHINE_SLOTS.forEach((slot, idx) => {
+        const hit = parsedList.find(p => !used.has(p.machine.id) && matchesSlot(slot, p.parsed));
+        if (hit) { used.add(hit.machine.id); assigned[idx] = hit; }
+      });
+      TV_MACHINE_SLOTS.forEach((slot, idx) => {
+        if (assigned[idx]) return;
+        const hit = parsedList.find(p => !used.has(p.machine.id) && p.parsed.base === slot.base);
+        if (hit) { used.add(hit.machine.id); assigned[idx] = hit; }
+      });
+
+      const leftovers = parsedList.filter(p => !used.has(p.machine.id));
+      if (leftovers.length > 0) {
+        console.warn('[TV] 以下機台未對應到看板格位，將不會顯示：', leftovers.map(p => p.machine.name));
+      }
+
+      return assigned
+        .map((item, idx) => (item ? { ...item, col: TV_MACHINE_SLOTS[idx].col, row: TV_MACHINE_SLOTS[idx].row } : null))
+        .filter(Boolean);
+    }
+
+    function TvReservationBadge({ typeLabel }) {
+      const isSlot = typeLabel === '預約';
+      return (
+        <span
+          style={{
+            background: isSlot ? '#F5A55B' : '#E8727C',
+            color: '#fff', fontSize: 15, fontWeight: 700, lineHeight: 1,
+            padding: '5px 12px', borderRadius: 999, flexShrink: 0
+          }}
+        >
+          {typeLabel}
+        </span>
+      );
+    }
+
+    function TvMachineCard({ card }) {
+      const theme = TV_THEME[card.statusKey];
+      return (
+        <div
+          style={{
+            gridColumn: card.col, gridRow: card.row,
+            background: theme.bg, border: `3px solid ${theme.border}`,
+            borderRadius: 22, padding: '14px 18px',
+            boxShadow: '0 5px 10px rgba(0,0,0,0.18)',
+            display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+            minWidth: 0, overflow: 'hidden'
+          }}
+        >
+          {/* 標題列：狀態燈 + 使用者/狀態 + 使用時段 ； 右側機台標籤與名稱 */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+              <span style={{ width: 24, height: 24, borderRadius: '50%', background: theme.dot, flexShrink: 0 }} />
+              <span style={{ fontSize: 42, fontWeight: 800, color: '#111', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {card.title}
+              </span>
+              {card.timeText && (
+                <span style={{ fontSize: 22, fontWeight: 600, color: '#222', whiteSpace: 'nowrap' }}>{card.timeText}</span>
+              )}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
+              <span
+                style={{
+                  visibility: card.tag ? 'visible' : 'hidden',
+                  background: '#fff', border: '1px solid #ccc', borderRadius: 999,
+                  fontSize: 15, fontWeight: 600, padding: '2px 12px', color: '#222'
+                }}
+              >
+                {card.tag || '-'}
+              </span>
+              <span style={{ fontSize: 26, fontWeight: 800, color: '#111', whiteSpace: 'nowrap' }}>{card.base}</span>
+            </div>
+          </div>
+
+          {/* 預約 / 排隊清單（固定顯示 2 列） */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {[0, 1].map(i => {
+              const row = card.rows[i];
+              return (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 12, height: 42,
+                    background: '#fff', borderRadius: 999, padding: '0 10px',
+                    border: '1px solid #ddd', boxShadow: '0 2px 4px rgba(0,0,0,0.12)'
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 26, height: 26, borderRadius: '50%', background: theme.dot, color: '#fff',
+                      fontSize: 15, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0
+                    }}
+                  >
+                    {i + 1}
+                  </span>
+                  {row && (
+                    <>
+                      <span style={{ fontSize: 22, fontWeight: 600, color: '#222', whiteSpace: 'nowrap' }}>{row.timeText}</span>
+                      <span style={{ fontSize: 22, fontWeight: 600, color: '#222', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {row.names}
+                      </span>
+                      <TvReservationBadge typeLabel={row.typeLabel} />
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function TvDisplayView({ onExit }) {
+      const { machines, reservations } = useApp();
+      const [now, setNow] = useState(() => new Date());
+      const [scale, setScale] = useState(1);
+      const [pageIndex, setPageIndex] = useState(0);
+      const [isControlsVisible, setIsControlsVisible] = useState(true);
+      const hideControlsTimerRef = useRef(null);
+
+      // 即時時鐘
+      useEffect(() => {
+        const timer = setInterval(() => setNow(new Date()), 1000);
+        return () => clearInterval(timer);
+      }, []);
+
+      // 依視窗大小等比縮放畫布（保持 16:9 不變形）
+      useEffect(() => {
+        const fit = () => setScale(Math.min(window.innerWidth / TV_CANVAS_WIDTH, window.innerHeight / TV_CANVAS_HEIGHT));
+        fit();
+        window.addEventListener('resize', fit);
+        return () => window.removeEventListener('resize', fit);
+      }, []);
+
+      const handleExit = useCallback(() => {
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+        onExit();
+      }, [onExit]);
+
+      const toggleFullscreen = () => {
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        } else if (document.documentElement.requestFullscreen) {
+          document.documentElement.requestFullscreen().catch(() => {});
+        }
+      };
+
+      // 退出路徑 1：鍵盤 Esc
+      useEffect(() => {
+        const onKeyDown = (e) => { if (e.key === 'Escape') handleExit(); };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+      }, [handleExit]);
+
+      // NOTE: 控制列平時隱藏以免干擾電視畫面，滑鼠移動 / 觸控時浮現 3 秒
+      const revealControls = useCallback(() => {
+        setIsControlsVisible(true);
+        clearTimeout(hideControlsTimerRef.current);
+        hideControlsTimerRef.current = setTimeout(() => setIsControlsVisible(false), 3000);
+      }, []);
+      useEffect(() => {
+        revealControls();
+        return () => clearTimeout(hideControlsTimerRef.current);
+      }, [revealControls]);
+
+      // 各機台卡片資料
+      const cards = useMemo(() => {
+        return arrangeTvMachines(machines).map(({ machine, parsed, col, row }) => {
+          const inUse = reservations.find(r => r.machineId === machine.id && r.status === '使用中');
+          const upcoming = reservations
+            .filter(r => r.machineId === machine.id && TV_UPCOMING_STATUSES.includes(r.status))
+            .sort((a, b) => a.startMinutes - b.startMinutes);
+
+          const statusKey = inUse ? 'busy' : machine.status === '等待報到' ? 'waiting' : 'idle';
+          const title = inUse ? (inUse.students || []).join('、') : statusKey === 'waiting' ? '等待中' : '空閒中';
+          const timeText = inUse ? `${inUse.startTimeFormatted}-${inUse.endTimeFormatted}` : '';
+
+          return {
+            id: machine.id, col, row, statusKey, title, timeText,
+            base: parsed.base, tag: parsed.tag,
+            rows: upcoming.slice(0, 2).map(r => ({
+              timeText: `${r.startTimeFormatted}-${r.endTimeFormatted}`,
+              names: (r.students || []).join('、'),
+              typeLabel: r.type === '時段預約' ? '預約' : '排隊'
+            }))
+          };
+        });
+      }, [machines, reservations]);
+
+      // 右側「請盡速報到」清單：已被叫號、等待報到的同學
+      const callList = useMemo(() => {
+        return reservations
+          .filter(r => r.status === '等候報到')
+          .sort((a, b) => a.startMinutes - b.startMinutes)
+          .map(r => {
+            const machine = machines.find(m => m.id === r.machineId);
+            const parsed = parseTvMachineName(machine ? machine.name : r.machineName);
+            return {
+              id: r.id,
+              names: (r.students || []).join('、'),
+              timeText: `${r.startTimeFormatted}-${r.endTimeFormatted}`,
+              typeLabel: r.type === '時段預約' ? '預約' : '排隊',
+              tag: parsed.tag,
+              base: parsed.base
+            };
+          });
+      }, [machines, reservations]);
+
+      const pageCount = Math.max(1, Math.ceil(callList.length / TV_QUEUE_PAGE_SIZE));
+      const currentPage = Math.min(pageIndex, pageCount - 1);
+
+      // 超過一頁時自動輪播
+      useEffect(() => {
+        if (pageCount <= 1) { setPageIndex(0); return undefined; }
+        const timer = setInterval(() => setPageIndex(p => (p + 1) % pageCount), TV_QUEUE_ROTATE_MS);
+        return () => clearInterval(timer);
+      }, [pageCount]);
+
+      const pageItems = callList.slice(currentPage * TV_QUEUE_PAGE_SIZE, (currentPage + 1) * TV_QUEUE_PAGE_SIZE);
+
+      const pad = (n) => String(n).padStart(2, '0');
+      const clockText = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      const dateText = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())} 星期${'日一二三四五六'[now.getDay()]}`;
+
+      const legendItems = [
+        { color: TV_THEME.waiting.dot, text: '機台等待中，請盡速至機台進行報到' },
+        { color: TV_THEME.busy.dot, text: '機台使用中' },
+        { color: TV_THEME.idle.dot, text: '機台空閒中，尚無人預約/排隊' }
+      ];
+
+      const controlButtonStyle = {
+        padding: '10px 18px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.4)',
+        background: 'rgba(15,23,42,0.85)', color: '#fff', fontSize: 16, fontWeight: 700, cursor: 'pointer'
+      };
+
+      return (
+        <div
+          onPointerMove={revealControls}
+          onPointerDown={revealControls}
+          style={{ position: 'fixed', inset: 0, background: '#E6E6E6', overflow: 'hidden', zIndex: 50 }}
+        >
+          {/* 退出 / 全螢幕控制列 */}
+          <div
+            style={{
+              position: 'fixed', top: 14, right: 14, zIndex: 60, display: 'flex', gap: 10,
+              opacity: isControlsVisible ? 1 : 0, pointerEvents: isControlsVisible ? 'auto' : 'none',
+              transition: 'opacity 0.3s'
+            }}
+          >
+            <button type="button" onClick={toggleFullscreen} style={controlButtonStyle}>⛶ 全螢幕</button>
+            <button type="button" onClick={handleExit} style={{ ...controlButtonStyle, background: 'rgba(185,28,28,0.92)' }}>✕ 退出看板</button>
+          </div>
+
+          <div
+            style={{
+              position: 'absolute', left: '50%', top: '50%',
+              width: TV_CANVAS_WIDTH, height: TV_CANVAS_HEIGHT,
+              transform: `translate(-50%, -50%) scale(${scale})`, transformOrigin: 'center center',
+              padding: '36px 40px', boxSizing: 'border-box',
+              fontFamily: "'Noto Sans TC', 'Microsoft JhengHei', system-ui, sans-serif", color: '#111'
+            }}
+          >
+            <div
+              style={{
+                display: 'grid', height: '100%', gap: 16,
+                gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gridTemplateRows: 'repeat(5, minmax(0, 1fr))'
+              }}
+            >
+              {cards.map(card => <TvMachineCard key={card.id} card={card} />)}
+
+              {/* 右下區塊：報到提醒清單 + 圖例 + 時鐘 */}
+              <div style={{ gridColumn: '3 / 5', gridRow: '3 / 6', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+                <div style={{ textAlign: 'center', fontSize: 22, fontWeight: 600, color: '#333' }}>
+                  ！以下同學請盡速至機台進行報到，逾時將自動順延至下一位！
+                </div>
+
+                <div style={{ flex: 1, minHeight: 0, background: '#F4F4F4', borderRadius: 28, padding: '16px 22px', display: 'flex', flexDirection: 'column', gap: 8, boxShadow: '0 2px 6px rgba(0,0,0,0.08)' }}>
+                  {pageItems.length === 0 && (
+                    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 30, fontWeight: 600, color: '#9a9a9a' }}>
+                      目前沒有需要報到的同學
+                    </div>
+                  )}
+                  {pageItems.map(item => (
+                    <div
+                      key={item.id}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 16, height: 60, flexShrink: 0,
+                        background: '#fff', border: '2px solid #666', borderRadius: 30, overflow: 'hidden', paddingRight: 20
+                      }}
+                    >
+                      <span
+                        style={{
+                          alignSelf: 'stretch', width: 36, background: '#666', color: '#fff', fontSize: 14, fontWeight: 700,
+                          writingMode: 'vertical-rl', textOrientation: 'upright', letterSpacing: 2,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0
+                        }}
+                      >
+                        {item.typeLabel}
+                      </span>
+                      <span style={{ fontSize: 36, fontWeight: 800, whiteSpace: 'nowrap' }}>{item.names}</span>
+                      <span style={{ fontSize: 32, fontWeight: 700, whiteSpace: 'nowrap' }}>{item.timeText}</span>
+                      <span style={{ flex: 1, height: 2, background: '#8a8a8a', minWidth: 20 }} />
+                      {item.tag && (
+                        <span style={{ background: '#777', color: '#fff', fontSize: 16, fontWeight: 700, padding: '3px 14px', borderRadius: 999, whiteSpace: 'nowrap' }}>
+                          {item.tag}
+                        </span>
+                      )}
+                      <span style={{ fontSize: 36, fontWeight: 800, whiteSpace: 'nowrap' }}>{item.base}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* 頁碼圓點 */}
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 10, height: 14 }}>
+                  {Array.from({ length: Math.max(pageCount, 1) }).map((_, i) => (
+                    <span
+                      key={i}
+                      style={{
+                        width: 14, height: 14, borderRadius: '50%', boxSizing: 'border-box',
+                        background: i === currentPage ? '#777' : 'transparent', border: '2px solid #777'
+                      }}
+                    />
+                  ))}
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 130 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {legendItems.map(item => (
+                      <div key={item.text} style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 22, fontWeight: 500, color: '#222' }}>
+                        <span style={{ width: 24, height: 24, borderRadius: '50%', background: item.color, flexShrink: 0 }} />
+                        {item.text}
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 104, fontWeight: 800, lineHeight: 1, letterSpacing: 2, fontVariantNumeric: 'tabular-nums' }}>{clockText}</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, marginTop: 6 }}>{dateText}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     function MainLayout() {
       const { 
         machines, 
@@ -4128,6 +4586,8 @@
       // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
       const [selectedMachine, setSelectedMachine] = useState(null);
       const [isRefreshing, setIsRefreshing] = useState(false);
+      // NOTE: 電視看板模式 —— 開啟後以全畫面覆蓋手機版面，退出後回到原本管理頁
+      const [isTvMode, setIsTvMode] = useState(false);
 
       // 動態取得最新的機台資料（避免在詳情頁時保留舊 snapshot）
       const currentSelectedMachine = selectedMachine 
@@ -4188,6 +4648,11 @@
 
       if (!isLoggedIn) {
         return <LoginView />;
+      }
+
+      // 電視看板（僅管理者可進入；非管理者即使狀態被改動也不顯示）
+      if (isTvMode && isAdmin) {
+        return <TvDisplayView onExit={() => setIsTvMode(false)} />;
       }
 
       // 目前頁面標題
@@ -4327,7 +4792,7 @@
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
               {isAdmin && activeTab === 'courses' && (
-                <CourseSessionsView onOpenReservationModal={(id) => openModal(id)} />
+                <CourseSessionsView onOpenReservationModal={(id) => openModal(id)} onOpenTvDisplay={() => setIsTvMode(true)} />
               )}
               {isAdmin && activeTab === 'settings' && <BookingSettingsView />}
             </div>
