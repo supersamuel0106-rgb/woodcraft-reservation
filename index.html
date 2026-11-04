@@ -87,6 +87,11 @@
     // 已通知的提醒 ID 集合（防止重複推播，存於 localStorage）
     const NOTIFIED_REMINDERS_KEY = 'wc_notified_reminders_v1';
 
+    // HACK: system_settings 表沒有 course_paused 欄位，且 App 金鑰無法修改資料表結構，
+    //       因此另建一列 id='COURSE_PAUSE'，以 manual_course_start_time 存「暫停開始時間」（null=未暫停）。
+    //       日後若在 Supabase 新增專用欄位，應改回正式欄位並刪除此列。
+    const COURSE_PAUSE_ROW_ID = 'COURSE_PAUSE';
+
     // ============================================================
     // 1c. 通知工具函式（瀏覽器推播 + Email）
     // ============================================================
@@ -722,17 +727,21 @@
       const [activeTab, setActiveTab] = useState('machines');
       const [isLiveSupabase, setIsLiveSupabase] = useState(true);
       const [isLoading, setIsLoading] = useState(true);
+      // NOTE: 課程暫停開始時間（ISO 字串），null 代表未暫停。以資料庫為唯一來源，
+      //       這樣電視看板與所有同學手機才會同步看到暫停畫面（原本只存在老師裝置的 localStorage）。
+      const [remotePausedAt, setRemotePausedAt] = useState(null);
 
       const refreshData = useCallback(async () => {
         if (!supabaseClient) return null;
         let freshReservations = null;
         try {
-          const [mRes, rRes, sRes, csRes, settRes] = await Promise.all([
+          const [mRes, rRes, sRes, csRes, settRes, pauseRes] = await Promise.all([
             supabaseClient.from('machines').select('*').order('id'),
             supabaseClient.from('reservations').select('*').order('created_at', { ascending: false }),
             supabaseClient.from('students').select('*').order('name'),
             supabaseClient.from('course_sessions').select('*').order('session_id'),
-            supabaseClient.from('system_settings').select('*').eq('id', 'DEFAULT').single()
+            supabaseClient.from('system_settings').select('*').eq('id', 'DEFAULT').single(),
+            supabaseClient.from('system_settings').select('manual_course_start_time').eq('id', COURSE_PAUSE_ROW_ID).maybeSingle()
           ]);
 
           // NOTE: 機台 id 格式為「N. 名稱」，以字串排序會導致 10 排在 2 前面，改用數字排序
@@ -792,6 +801,10 @@
           setStudents(rawStudents);
           setCourseSessions(rawSessions);
           setSystemSettings(settRes.data || null);
+          // 讀取失敗時保留原狀態，避免網路抖動讓暫停畫面誤消失
+          if (!pauseRes.error) {
+            setRemotePausedAt(pauseRes.data?.manual_course_start_time || null);
+          }
           setIsLiveSupabase(true);
           // NOTE: 回傳最新預約快照，讓呼叫端（例如新增排隊後叫號）不必依賴 state 閉包中過期的舊資料
           freshReservations = rawReservations;
@@ -1567,35 +1580,33 @@
         };
       };
 
-      const [localPauseState, setLocalPauseState] = useState(() => {
-        try {
-          return JSON.parse(localStorage.getItem('wc_course_pause_state') || '{"isPaused":false}');
-        } catch {
-          return { isPaused: false };
-        }
-      });
+      // 是否暫停中（資料庫為唯一來源，所有裝置共用）
+      const isCoursePaused = !!remotePausedAt;
+      const coursePausedAt = remotePausedAt;
 
-      // 是否暫停中（優先看 systemSettings 或 local state）
-      const isCoursePaused = !!(systemSettings?.course_paused || localPauseState.isPaused);
-      const coursePausedAt = systemSettings?.course_paused_at || localPauseState.pausedAt || null;
+      /**
+       * 寫入暫停狀態到資料庫
+       * @param pausedAtIso 暫停開始時間（ISO），null 代表恢復
+       * @returns 是否寫入成功
+       */
+      const writeCoursePauseState = async (pausedAtIso) => {
+        const { error } = await supabaseClient
+          .from('system_settings')
+          .update({ manual_course_start_time: pausedAtIso })
+          .eq('id', COURSE_PAUSE_ROW_ID);
+        if (error) console.error('Supabase pause update error:', error);
+        return !error;
+      };
 
       const pauseCourse = async (notes = '老師講解中') => {
-        const pauseObj = {
-          isPaused: true,
-          pausedAt: new Date().toISOString(),
-          notes
-        };
-        setLocalPauseState(pauseObj);
-        localStorage.setItem('wc_course_pause_state', JSON.stringify(pauseObj));
-
-        try {
-          await supabaseClient.from('system_settings').update({
-            course_paused: true,
-            course_paused_at: pauseObj.pausedAt
-          }).eq('id', 'DEFAULT');
-        } catch (e) {
-          console.warn('Supabase pause update note:', e);
+        const pausedAtIso = new Date().toISOString();
+        const ok = await writeCoursePauseState(pausedAtIso);
+        if (!ok) {
+          alert('⚠️ 暫停狀態寫入資料庫失敗，電視與同學手機不會顯示暫停畫面。請檢查網路後再試一次。');
+          return { success: false };
         }
+        // 先本機立即生效，其他裝置於下次輪詢（最多 8 秒）同步
+        setRemotePausedAt(pausedAtIso);
 
         const notif = {
           id: `N_${Date.now()}`,
@@ -1607,6 +1618,7 @@
         };
         setNotifications(prev => [notif, ...prev]);
         await refreshData();
+        return { success: true };
       };
 
       const resumeCourse = async () => {
@@ -1634,16 +1646,11 @@
           }).eq('id', r.id);
         }
 
-        setLocalPauseState({ isPaused: false });
-        localStorage.removeItem('wc_course_pause_state');
-
-        try {
-          await supabaseClient.from('system_settings').update({
-            course_paused: false,
-            course_paused_at: null
-          }).eq('id', 'DEFAULT');
-        } catch (e) {
-          console.warn('Supabase resume update note:', e);
+        const ok = await writeCoursePauseState(null);
+        if (!ok) {
+          alert('⚠️ 恢復狀態寫入資料庫失敗，電視與手機可能仍顯示暫停畫面。請再按一次「恢復課程」。');
+        } else {
+          setRemotePausedAt(null);
         }
 
         const notif = {
