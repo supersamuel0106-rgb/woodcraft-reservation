@@ -69,6 +69,37 @@
     const AUTH_STORAGE_KEY = 'factory_v04_logged_in_email';
     const supabaseClient = window.supabase?.createClient ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
+    // NOTE: reservations 表目前缺少 advance_offered_at / notes 欄位。
+    //       程式多處更新預約時（叫號、保留時段…）會一併寫入這兩欄，資料庫會「整筆更新被拒絕」，
+    //       且 Supabase 只回傳 error、不會丟例外，結果預約狀態永遠停在「排隊中」、看板不會變橘色。
+    //       因此在寫入層統一略過資料庫沒有的欄位；refreshData 偵測到欄位存在時會自動恢復寫入。
+    const MISSING_RESERVATION_COLUMNS = new Set(['advance_offered_at', 'notes']);
+
+    function stripMissingReservationColumns(values) {
+      if (MISSING_RESERVATION_COLUMNS.size === 0) return values;
+      const strip = (row) => {
+        if (!row || typeof row !== 'object') return row;
+        const copy = { ...row };
+        MISSING_RESERVATION_COLUMNS.forEach(col => { delete copy[col]; });
+        return copy;
+      };
+      return Array.isArray(values) ? values.map(strip) : strip(values);
+    }
+
+    if (supabaseClient) {
+      const originalFrom = supabaseClient.from.bind(supabaseClient);
+      supabaseClient.from = (table) => {
+        const builder = originalFrom(table);
+        if (table === 'reservations') {
+          const originalUpdate = builder.update.bind(builder);
+          const originalInsert = builder.insert.bind(builder);
+          builder.update = (values, options) => originalUpdate(stripMissingReservationColumns(values), options);
+          builder.insert = (values, options) => originalInsert(stripMissingReservationColumns(values), options);
+        }
+        return builder;
+      };
+    }
+
     // ============================================================
     // 1b. EmailJS 通知設定（★ 請於 emailjs.com 設定完成後填入以下金鑰 ★）
     // ============================================================
@@ -772,6 +803,15 @@
             advanceOfferedAt: row.advance_offered_at,
             notes: row.notes
           }));
+          // 依實際回傳的欄位更新「缺少欄位」清單（資料庫補上欄位後自動恢復寫入）
+          if ((rRes.data || []).length > 0) {
+            const sampleRow = rRes.data[0];
+            ['advance_offered_at', 'notes'].forEach(col => {
+              if (col in sampleRow) MISSING_RESERVATION_COLUMNS.delete(col);
+              else MISSING_RESERVATION_COLUMNS.add(col);
+            });
+          }
+
           const rawStudents = (sRes.data || []).map(row => ({ id: row.id, name: row.name, studentNumber: row.student_number, mail: row.mail, role: row.role }));
           const rawSessions = (csRes.data || []).map(row => ({ id: row.id, sessionId: row.session_id, startTime: row.start_time, endTime: row.end_time, isCurrent: row.is_current, notes: row.notes }));
 
