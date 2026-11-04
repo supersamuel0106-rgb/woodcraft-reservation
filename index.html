@@ -367,19 +367,30 @@
       });
     }
 
-    // 檢查學生名單在「所有機台」中是否有同時段的衝突（同時間不可預約不同機台）
-    function findStudentConflict(reservations, students = [], userEmail = '', startMin = 0, durationMin = 0, ignoreId = null) {
+    /**
+     * 檢查學生名單在「其他機台」中是否有同時段的衝突（同時間不可於不同機台操作）
+     * @param reservations 所有預約資料
+     * @param students 學生名單陣列
+     * @param userEmail 建立者信箱
+     * @param startMin 時段開始分鐘
+     * @param durationMin 時長
+     * @param ignoreId 忽略的預約 ID（通常為自己）
+     * @param ignoreMachineId 忽略的機台 ID（同機台自己的隊列排程不算跨機台衝突！）
+     */
+    function findStudentConflict(reservations, students = [], userEmail = '', startMin = 0, durationMin = 0, ignoreId = null, ignoreMachineId = null) {
       const endMin = startMin + durationMin;
       const studentSet = new Set(students || []);
       return reservations.find(r => {
         if (r.id === ignoreId) return false;
+        // NOTE: 同一機台的排隊是前後接續的順序，絕對不可視為「跨機台衝突」
+        if (ignoreMachineId && r.machineId === ignoreMachineId) return false;
         if (r.status === '已取消' || r.status === '已完成' || r.status === '未報到') return false;
         const hasOverlap = r.startMinutes < endMin && r.endMinutes > startMin;
         if (!hasOverlap) return false;
 
-        const isSameEmail = userEmail && r.email && r.email.toLowerCase() === userEmail.toLowerCase();
+        // 僅以實際學生姓名判斷是否分身乏術，避免同帳號代排被誤殺
         const hasCommonStudent = (r.students || []).some(s => studentSet.has(s));
-        return isSameEmail || hasCommonStudent;
+        return hasCommonStudent;
       });
     }
 
@@ -843,13 +854,13 @@
         // 規則：若預備提前/叫號的那位同學在該時段本來預計有其他機台的預約或排隊，則直接跳過！
         const availableQueueList = queueList.filter(item => {
           const dur = item.durationMinutes || 20;
-          const conflict = findStudentConflict(sourceRes, item.students, item.email, nowMinutes, dur, item.id);
+          const conflict = findStudentConflict(sourceRes, item.students, item.email, nowMinutes, dur, item.id, machineId);
           return !conflict;
         });
 
         const availableSlotList = eligibleSlotList.filter(slot => {
           const dur = slot.durationMinutes || 20;
-          const conflict = findStudentConflict(sourceRes, slot.students, slot.email, nowMinutes, dur, slot.id);
+          const conflict = findStudentConflict(sourceRes, slot.students, slot.email, nowMinutes, dur, slot.id, machineId);
           return !conflict;
         });
 
@@ -965,7 +976,7 @@
         const newEnd = calculateUsageEndMinutes(target, nowMinutes);
 
         // 再次確認接受提前時是否有跨機台衝突
-        const conflict = findStudentConflict(reservations, target.students, target.email, nowMinutes, target.durationMinutes, target.id);
+        const conflict = findStudentConflict(reservations, target.students, target.email, nowMinutes, target.durationMinutes, target.id, target.machineId);
         if (conflict) {
           alert(`⚠️ 無法提前：名單中的同學在【${conflict.machineName}】已有時段（${conflict.startTimeFormatted} ～ ${conflict.endTimeFormatted}），同時間不可重複使用！已為您保留原預約時段。`);
           await declineEarlyStart(reservationId);
@@ -1066,12 +1077,12 @@
         let substitute = queueList.find(q => {
           const dur = q.durationMinutes || 20;
           if (!fitsBeforeNextSlot(dur)) return false;
-          return !findStudentConflict(snapshot, q.students, q.email, nowMinutes, dur, q.id);
+          return !findStudentConflict(snapshot, q.students, q.email, nowMinutes, dur, q.id, overdue.machineId);
         });
 
         // 若因時段塞不下但後面確實有候補人，直接取第一位無跨機台衝突者替補
         if (!substitute) {
-          substitute = queueList.find(q => !findStudentConflict(snapshot, q.students, q.email, nowMinutes, q.durationMinutes || 20, q.id));
+          substitute = queueList.find(q => !findStudentConflict(snapshot, q.students, q.email, nowMinutes, q.durationMinutes || 20, q.id, overdue.machineId));
         }
 
         if (!substitute) {
@@ -1240,6 +1251,22 @@
               }
             }
 
+            // 規則 1b: 現場排隊排在首位，但時段結束時間已過且尚未開始使用（逾期未報到）
+            // 例如排定 17:36~17:46，現在已過 17:46 卻未開機，立即視為逾期順延給下一位
+            if (r.type === '現場排隊' && (r.status === '等候報到' || r.status === '排隊中') && !swappedMachines.has(r.machineId)) {
+              const sameMacActive = reservations.filter(x => x.machineId === r.machineId && (x.status === '使用中' || x.status === '等候報到' || x.status === '排隊中'));
+              const isFirst = sameMacActive.sort((a,b) => a.startMinutes - b.startMinutes)[0]?.id === r.id;
+              const macInUse = sameMacActive.some(x => x.status === '使用中');
+              if (isFirst && !macInUse && currentMin >= r.endMinutes) {
+                console.log(`[Queue-Expired] 現場排隊時段已過期未報到，直接順延換下一位：${r.machineName}`);
+                const swapped = await handleOverdueReservation(r, reservations, currentMin, graceMin);
+                if (swapped) {
+                  swappedMachines.add(r.machineId);
+                  updatedAny = true;
+                }
+              }
+            }
+
             // 規則 2: 時段預約等候提前確認 逾時 3 分鐘未回應 -> 保留原時段，自動叫下一位
             if (r.type === '時段預約' && r.status === '等候提前確認') {
               if (r.advanceOfferedAt) {
@@ -1292,7 +1319,7 @@
           for (const r of reservations) {
             if (r.type !== '現場排隊' || r.status !== '排隊中') continue;
             if (busyMachineIds.has(r.machineId) || machinesToAdvance.has(r.machineId) || swappedMachines.has(r.machineId)) continue;
-            const hasConflict = findStudentConflict(reservations, r.students, r.email, currentMin, r.durationMinutes || 20, r.id);
+            const hasConflict = findStudentConflict(reservations, r.students, r.email, currentMin, r.durationMinutes || 20, r.id, r.machineId);
             if (hasConflict) continue;
             console.log(`[Queue-Heal] 機台閒置但有人排隊未叫號，補叫號：${r.machineId}`);
             machinesToAdvance.add(r.machineId);
