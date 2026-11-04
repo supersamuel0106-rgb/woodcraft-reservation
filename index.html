@@ -4927,55 +4927,105 @@
       return (
         <div
           style={{
-            gridColumn: card.col, gridRow: card.row,
-            background: theme.bg, border: `3px solid ${theme.border}`,
+            gridColumn: card.col,
+            gridRow: card.row,
+            width: '100%',
+            height: '100%',
+            minWidth: 0,
+            minHeight: 0,
+            boxSizing: 'border-box',
+            background: theme.bg,
+            border: `3px solid ${theme.border}`,
             borderRadius: 22,
-            padding: card.tag ? '12px 18px 16px' : '14px 18px',
+            // NOTE: 所有機台卡片統一相同內距與固定區塊高度，確保跨卡片候位框上下左右 0px 誤差對齊
+            padding: '12px 18px 14px',
             boxShadow: '0 5px 10px rgba(0,0,0,0.18)',
-            display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
-            minWidth: 0, overflow: 'hidden'
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            overflow: 'hidden'
           }}
         >
-          {/* 標題列：狀態燈 + 使用者/狀態（長名跑馬燈） + 使用時段 ； 右側機台標籤與名稱 */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: 1, overflow: 'hidden' }}>
+          {/* 標題列：固定高度 54px，無論有無副標籤皆不會撐動下方候位框垂直位置 */}
+          <div
+            style={{
+              height: 54,
+              minHeight: 54,
+              maxHeight: 54,
+              flexShrink: 0,
+              width: '100%',
+              minWidth: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12
+            }}
+          >
+            <div style={{ height: '100%', display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: 1, overflow: 'hidden' }}>
               <span style={{ width: 24, height: 24, borderRadius: '50%', background: theme.dot, flexShrink: 0 }} />
               <TvMarqueeText
                 text={card.title}
                 forceMarquee={card.isMultiple}
-                style={{ fontSize: 42, fontWeight: 800, color: '#111', minWidth: 0, flexShrink: 1 }}
+                style={{ fontSize: 42, fontWeight: 800, lineHeight: 1.1, color: '#111', minWidth: 0, flexShrink: 1 }}
               />
               {card.timeText && (
-                <span style={{ fontSize: 22, fontWeight: 600, color: '#222', whiteSpace: 'nowrap', flexShrink: 0 }}>{card.timeText}</span>
+                <span style={{ fontSize: 22, fontWeight: 600, lineHeight: 1, fontVariantNumeric: 'tabular-nums', color: '#222', whiteSpace: 'nowrap', flexShrink: 0 }}>{card.timeText}</span>
               )}
             </div>
-            {/* 右側機台名稱與標籤：標籤與機台名稱間隙拉近；若無標籤（如圓鋸機、推台鋸），直接與左側狀態單列置中對齊 */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center', gap: card.tag ? 1 : 0, flexShrink: 0 }}>
+            {/* 右側機台名稱與標籤：置於固定 54px 容器內垂直居中；無標籤時與左側狀態同軸置中 */}
+            <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center', gap: card.tag ? 2 : 0, flexShrink: 0 }}>
               {card.tag && (
                 <span
                   style={{
                     background: '#fff', border: '1px solid #ccc', borderRadius: 999,
-                    fontSize: 15, fontWeight: 600, padding: '1px 11px', color: '#222', lineHeight: 1.15
+                    fontSize: 15, fontWeight: 600, padding: '1px 11px', color: '#222', lineHeight: 1.1,
+                    boxSizing: 'border-box'
                   }}
                 >
                   {card.tag}
                 </span>
               )}
-              <span style={{ fontSize: 26, fontWeight: 600, color: '#111', whiteSpace: 'nowrap', lineHeight: 1.15 }}>{card.base}</span>
+              <span style={{ fontSize: 26, fontWeight: 600, color: '#111', whiteSpace: 'nowrap', lineHeight: 1.1 }}>{card.base}</span>
             </div>
           </div>
 
-          {/* 預約 / 排隊清單（固定顯示 2 列） */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {/* 預約 / 排隊清單（固定總高 92px、每列固定 42px、寬度 100%，確保跨卡片上下左右精準對齊） */}
+          <div
+            style={{
+              height: 92,
+              minHeight: 92,
+              maxHeight: 92,
+              flexShrink: 0,
+              width: '100%',
+              minWidth: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'space-between',
+              gap: 8
+            }}
+          >
             {[0, 1].map(i => {
               const row = card.rows[i];
               return (
                 <div
                   key={i}
                   style={{
-                    display: 'flex', alignItems: 'center', gap: 12, height: 42,
-                    background: '#fff', borderRadius: 999, padding: '0 10px',
-                    border: '1px solid #ddd', boxShadow: '0 2px 4px rgba(0,0,0,0.12)'
+                    width: '100%',
+                    minWidth: 0,
+                    height: 42,
+                    minHeight: 42,
+                    maxHeight: 42,
+                    flexShrink: 0,
+                    boxSizing: 'border-box',
+                    overflow: 'hidden',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 12,
+                    background: '#fff',
+                    borderRadius: 999,
+                    padding: '0 10px',
+                    border: '1px solid #ddd',
+                    boxShadow: '0 2px 4px rgba(0,0,0,0.12)'
                   }}
                 >
                   <span
@@ -4988,7 +5038,7 @@
                   </span>
                   {row && (
                     <>
-                      <span style={{ fontSize: 22, fontWeight: 600, color: '#222', whiteSpace: 'nowrap', flexShrink: 0 }}>{row.timeText}</span>
+                      <span style={{ fontSize: 22, fontWeight: 600, fontVariantNumeric: 'tabular-nums', color: '#222', whiteSpace: 'nowrap', flexShrink: 0 }}>{row.timeText}</span>
                       <TvMarqueeText
                         text={row.names}
                         forceMarquee={row.isMultiple}
@@ -5164,14 +5214,14 @@
           >
             <div
               style={{
-                display: 'grid', height: '100%', gap: 16,
+                display: 'grid', width: '100%', height: '100%', gap: 16,
                 gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gridTemplateRows: 'repeat(5, minmax(0, 1fr))'
               }}
             >
               {cards.map(card => <TvMachineCard key={card.id} card={card} />)}
 
               {/* 右下區塊：報到提醒清單 + 圖例 + 時鐘 */}
-              <div style={{ gridColumn: '3 / 5', gridRow: '3 / 6', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+              <div style={{ gridColumn: '3 / 5', gridRow: '3 / 6', display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
                 <div style={{ textAlign: 'center', fontSize: 22, fontWeight: 600, color: '#333' }}>
                   ！以下同學請盡速至機台進行報到，逾時將自動順延至下一位！
                 </div>
