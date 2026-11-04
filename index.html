@@ -410,6 +410,15 @@
         return { canStart: true, reason: '' };
       }
 
+      // 現場排隊：檢查叫號是否已超過報到寬限期
+      if (target.type === '現場排隊' && target.status === '等候報到' && target.calledAt) {
+        const calledTime = new Date(target.calledAt).getTime();
+        const graceMin = 3; // 預設 3 分鐘寬限
+        if (Date.now() - calledTime >= graceMin * 60 * 1000) {
+          return { canStart: false, reason: `已超過 ${graceMin} 分鐘報到寬限時間！系統已將機會順延給下一位同學。` };
+        }
+      }
+
       // 現場排隊：排序在自己之前、仍在等候的人都算「前面有人」
       const ahead = sameMachine
         .filter(r => WAITING_STATUSES.includes(r.status) && r.startMinutes < target.startMinutes)
@@ -1027,14 +1036,54 @@
         const fitsBeforeNextSlot = (dur) =>
           !blockingSlots.some(s => s.startMinutes < nowMinutes + dur && s.endMinutes > nowMinutes);
 
+        // 規則 1: 現場排隊等候報到逾時 -> 直接移交給下一位；若無候補者則移出並將機台釋放為空閒
+        if (queueList.length === 0) {
+          // 後面沒有人現場排隊：逾時者移至排隊中（或取消叫號），機台直接釋放回空閒
+          await supabaseClient.from('reservations').update({
+            status: '排隊中',
+            called_at: null,
+            notes: '報到逾時，已釋放機台'
+          }).eq('id', overdue.id);
+
+          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', overdue.machineId);
+
+          const stamp = new Date().toLocaleTimeString('zh-TW');
+          setNotifications(prev => [
+            {
+              id: `N_${Date.now()}_ovd_idle`,
+              timestamp: stamp,
+              recipientName: (overdue.students || []).join(', '),
+              machineName: overdue.machineName,
+              subject: '【逾時未報到】機台已釋放',
+              body: `親愛的 ${(overdue.students || []).join(', ')} 同學：您在【${overdue.machineName}】超過 ${graceMin} 分鐘未報到，系統已釋放機台，請重新排隊或等候叫號。`
+            },
+            ...prev
+          ]);
+          return true;
+        }
+
         // 找第一位「現在就能用完、且名單中同學在其他機台沒有衝突」的排隊者
-        const substitute = queueList.find(q => {
+        let substitute = queueList.find(q => {
           const dur = q.durationMinutes || 20;
           if (!fitsBeforeNextSlot(dur)) return false;
           return !findStudentConflict(snapshot, q.students, q.email, nowMinutes, dur, q.id);
         });
 
-        if (!substitute) return false;
+        // 若因時段塞不下但後面確實有候補人，直接取第一位無跨機台衝突者替補
+        if (!substitute) {
+          substitute = queueList.find(q => !findStudentConflict(snapshot, q.students, q.email, nowMinutes, q.durationMinutes || 20, q.id));
+        }
+
+        if (!substitute) {
+          // 後面排隊者全都有跨機台衝突：逾時者移開，機台設為空閒
+          await supabaseClient.from('reservations').update({
+            status: '排隊中',
+            called_at: null,
+            notes: '報到逾時，候補者皆有時段衝突'
+          }).eq('id', overdue.id);
+          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', overdue.machineId);
+          return true;
+        }
 
         // --- 替補者：立即叫號 ---
         const subDur = substitute.durationMinutes || 20;
