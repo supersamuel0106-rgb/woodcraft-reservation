@@ -528,14 +528,13 @@
     }
 
     /**
-     * 判斷預約是否已經上機使用（或已結束/取消），不可再被逾時掃描或隊列重排退回「排隊中」
+     * 判斷預約是否已經處於上機使用中（或已結束/取消），不可再被逾時掃描或隊列重排退回「排隊中」
      * @param {Object} r 預約物件或資料庫資料列
      * @returns {boolean}
      */
     function hasReservationStartedOrInUse(r) {
       if (!r) return false;
-      if (r.status === '使用中' || r.status === '已完成' || r.status === '已取消') return true;
-      return Boolean(r.startedAt || r.started_at);
+      return r.status === '使用中' || r.status === '已完成' || r.status === '已取消';
     }
 
     /**
@@ -548,7 +547,7 @@
     function isOverdueReleasedReservation(r) {
       if (!r || r.status !== '排隊中') return false;
       if (typeof r.notes === 'string' && r.notes.includes('報到逾時')) return true;
-      return Boolean(r.calledAt || r.called_at);
+      return Boolean(r.calledAt || r.called_at || r.startedAt || r.started_at);
     }
 
     /**
@@ -584,7 +583,6 @@
           .sort((a, b) => a.startMinutes - b.startMinutes);
 
         let machineFreeAt = nowMinutes;
-        const hasActiveBlocker = inUseList.length > 0 || checkinList.length > 0;
 
         // 1. 使用中：至少佔用到原訂結束時間或下一分鐘（若前人微幅超時尚未按結束）
         for (const r of inUseList) {
@@ -611,14 +609,13 @@
         }
 
         // 3. 排隊中 / 等待中：依序推算預計使用區間
+        // 區分「尚未逾時釋放的固定時段預約」與「現場排隊 / 已逾時釋放保留資格的預約」
         const slotIntervalsOnMac = [];
-        for (const r of waitingList.filter(x => x.type === '時段預約')) {
+        const fixedSlotWaiters = waitingList.filter(x => x.type === '時段預約' && !isOverdueReleasedReservation(x));
+        const rollingQueueWaiters = waitingList.filter(x => !fixedSlotWaiters.includes(x));
+
+        for (const r of fixedSlotWaiters) {
           const dur = r.durationMinutes || Math.max(10, r.endMinutes - r.startMinutes) || 20;
-          const isExpiredUnattended = !hasActiveBlocker && r.endMinutes <= nowMinutes;
-          if (isExpiredUnattended) {
-            intervals.push({ start: r.startMinutes, end: r.endMinutes, reservation: r });
-            continue;
-          }
           const estStart = Math.max(r.startMinutes, machineFreeAt);
           const estEnd = r.startMinutes < machineFreeAt ? (estStart + dur) : Math.max(r.endMinutes, estStart + dur);
           const range = { start: Math.min(r.startMinutes, estStart), end: estEnd, reservation: r };
@@ -630,17 +627,12 @@
         }
 
         let runningQueueStart = machineFreeAt;
-        for (const r of waitingList.filter(x => x.type !== '時段預約')) {
+        for (const r of rollingQueueWaiters) {
           const dur = r.durationMinutes || Math.max(10, r.endMinutes - r.startMinutes) || 20;
           const isOverdueReleased = isOverdueReleasedReservation(r);
-          // 若機台前方無人佔用且該筆已超過結束時間（或已報到逾時釋放），維持原帳面時段不無限往後推移
-          if (!hasActiveBlocker && (r.endMinutes <= nowMinutes || (isOverdueReleased && r.startMinutes < nowMinutes))) {
-            intervals.push({ start: r.startMinutes, end: r.endMinutes, reservation: r });
-            continue;
-          }
 
           let estStart = Math.max(r.startMinutes, runningQueueStart);
-          // 避開同機台已排定的時段預約
+          // 避開同機台已排定的固定時段預約
           let bumped = true;
           while (bumped) {
             bumped = false;
@@ -653,8 +645,11 @@
           }
           const estEnd = estStart + dur;
           const rangeStart = (r.startMinutes < estStart && r.endMinutes > nowMinutes) ? r.startMinutes : estStart;
-          intervals.push({ start: rangeStart, end: estEnd, reservation: r });
-          runningQueueStart = estEnd;
+          intervals.push({ start: rangeStart, end: estEnd, reservation: r, isOverdueReleased });
+          // 已逾時釋放者在新同學加入同機台排隊時會自動退到後方禮讓，不推高同機台其他未逾時候補者的基準起點
+          if (!isOverdueReleased) {
+            runningQueueStart = estEnd;
+          }
         }
       }
 
@@ -689,8 +684,10 @@
       const studentSet = new Set(normalizeStudentList(students));
       const busyIntervals = getEffectiveBusyIntervals(reservations, nowMinutes);
 
-      for (const { start, end, reservation: r } of busyIntervals) {
+      for (const { start, end, reservation: r, isOverdueReleased } of busyIntervals) {
         if (r.id === ignoreId) continue;
+        // 已逾時釋放的彈性保留單會自動隨新排程往後順推，不反過來鎖死其他機台的正常預約或報到
+        if (typeof nowMinutes === 'number' && isOverdueReleased) continue;
         // NOTE: 同一機台的前後排隊順序由機台排程本身控管，傳入 ignoreMachineId 時不重複視為跨機台衝突
         if (ignoreMachineId && r.machineId === ignoreMachineId) continue;
         if (!(start < endMin && end > startMin)) continue;
@@ -737,9 +734,12 @@
         }
 
         // 2. 檢查名單內所有組員在其他機台準備使用或使用中的時段
-        for (const { start, end, reservation: r } of busyIntervals) {
+        const itemIsOverdueReleased = isOverdueReleasedReservation(item);
+        for (const { start, end, reservation: r, isOverdueReleased } of busyIntervals) {
           if (r.id === item.id) continue;
           if (r.machineId === item.machineId) continue;
+          // 正常預約計算時，其他機台已逾時釋放的保留單會自動往後讓開，不阻擋正常預約
+          if (!itemIsOverdueReleased && isOverdueReleased) continue;
           if (!(start < candEnd && end > candStart)) continue;
 
           const matched = getOverlappingStudentNames(r, studentSet, item.email);
@@ -961,12 +961,15 @@
         const candEnd = candStart + durationMin;
 
         // 1. 本機台在 [candStart, candEnd] 內是否有任何重疊佔用
+        //    （已逾時釋放保留資格的預約在新同學排同機台時會自動禮讓順延，不阻擋新同學優先使用當下空檔）
         const machineHits = busyIntervals.filter(
-          x => x.reservation.machineId === machineId && x.start < candEnd && x.end > candStart
+          x => x.reservation.machineId === machineId && !x.isOverdueReleased && x.start < candEnd && x.end > candStart
         );
 
         // 2. 名單中所有同學在「所有機台」於 [candStart, candEnd] 內是否有任何準備使用或使用中的重疊預約
+        //    （已逾時釋放的保留單本身會彈性順推更新預計時段，不阻擋建立新排隊）
         const studentHits = busyIntervals.filter(x => {
+          if (x.isOverdueReleased) return false;
           if (!(x.start < candEnd && x.end > candStart)) return false;
           return getOverlappingStudentNames(x.reservation, studentSet, userEmail).length > 0;
         });
@@ -1041,10 +1044,11 @@
         };
       }
 
-      // 2. 機台時段衝突（檢查該機台是否有後續已預約/排隊時段重疊）
-      const machineInterval = busyIntervals.find(({ start, end, reservation: r }) => {
+      // 2. 機台時段衝突（檢查該機台是否有後續已預約/排隊時段重疊；現場排隊模式下，已逾時釋放者會自動禮讓順延）
+      const machineInterval = busyIntervals.find(({ start, end, reservation: r, isOverdueReleased }) => {
         if (r.machineId !== machineId) return false;
         if (r.id === ignoreId) return false;
+        if (typeof nowMinutes === 'number' && isOverdueReleased) return false;
         return start < endMin && end > startMin;
       });
       if (machineInterval) {
@@ -1059,8 +1063,9 @@
       }
 
       // 3. 學生（含所有共同組員）時段衝突
-      const studentInterval = busyIntervals.find(({ start, end, reservation: r }) => {
+      const studentInterval = busyIntervals.find(({ start, end, reservation: r, isOverdueReleased }) => {
         if (r.id === ignoreId) return false;
+        if (typeof nowMinutes === 'number' && isOverdueReleased) return false;
         if (!(start < endMin && end > startMin)) return false;
         return getOverlappingStudentNames(r, studentSet, userEmail).length > 0;
       });
@@ -1316,6 +1321,7 @@
             } else {
               updatePayload.called_at = null;
             }
+            updatePayload.started_at = null;
 
             // NOTE: 加上原子條件保護，絕不覆寫剛在另一台裝置按下「開始使用」的預約
             const { data: updatedRows } = await supabaseClient
@@ -1323,7 +1329,6 @@
               .update(updatePayload)
               .eq('id', item.id)
               .in('status', WAITING_RESERVATION_STATUSES)
-              .is('started_at', null)
               .select('id');
 
             if (isFirst) {
@@ -1363,18 +1368,15 @@
           return;
         }
 
-        // 若目前沒有任何現場排隊者能在當下立即開始（例如組員在其他機台尚有待用預約），
-        // 仍依序校正隊列中各筆現場排隊的預計開始時間，確保避開組員最新預約且不拉回撞期
+        // 若目前沒有任何現場排隊者能在當下立即開始（例如組員在其他機台尚有待用預約，或為保留資格預約），
+        // 依序校正隊列中各筆現場排隊的預計開始與結束時間，確保隨當前時間與組員最新預約動態更新
         const scheduledQueueRanges = [];
         if (queueList.length > 0) {
           const combinedRanges = [...slotRanges];
           let runningStartMin = nowMinutes;
           for (const item of queueList) {
-            const dur = item.durationMinutes || 20;
+            const dur = item.durationMinutes || Math.max(10, (item.endMinutes - item.startMinutes) || 20);
             const isOverdueReleased = isOverdueReleasedReservation(item);
-            if (isOverdueReleased && item.endMinutes <= nowMinutes) {
-              continue;
-            }
             const candStart = findEarliestValidStartForReservation(item, runningStartMin, combinedRanges, sourceRes, nowMinutes);
             const candEnd = candStart + dur;
             combinedRanges.push({ start: candStart, end: candEnd });
@@ -1389,13 +1391,15 @@
                   end_minutes: candEnd,
                   start_time_formatted: minutesToTime(candStart),
                   end_time_formatted: minutesToTime(candEnd),
-                  called_at: isOverdueReleased ? item.calledAt : null
+                  called_at: isOverdueReleased ? (item.calledAt || item.startedAt) : null,
+                  started_at: null
                 })
                 .eq('id', item.id)
-                .in('status', WAITING_RESERVATION_STATUSES)
-                .is('started_at', null);
+                .in('status', WAITING_RESERVATION_STATUSES);
             }
-            runningStartMin = candEnd;
+            if (!isOverdueReleased) {
+              runningStartMin = candEnd;
+            }
           }
         }
 
@@ -1428,7 +1432,6 @@
             .update(updatePayload)
             .eq('id', nextCandidate.id)
             .in('status', WAITING_RESERVATION_STATUSES)
-            .is('started_at', null)
             .select('id');
 
           if (!offeredRows || offeredRows.length === 0) {
@@ -1508,8 +1511,7 @@
             notes: '已保留原時段（婉拒提前）'
           })
           .eq('id', reservationId)
-          .eq('status', '等候提前確認')
-          .is('started_at', null);
+          .eq('status', '等候提前確認');
 
         const updatedSnapshot = reservations.map(r => 
           r.id === reservationId ? { ...r, status: '排隊中', advanceOfferedAt: null } : r
@@ -1521,10 +1523,10 @@
       /**
        * 逾時未報到處理（取代原本「直接取消」的做法）
        * NOTE: 規則
-       * 1. 後面沒有可替補的現場排隊者 ➔ 釋放機台，保留資格（並以非空 called_at 標記已逾時釋放）
+       * 1. 後面沒有可替補的現場排隊者 ➔ 釋放機台，保留資格並同步更新預計開始～結束時間（以非空 called_at 標記已逾時釋放）
        * 2. 後面有人現場排隊 ➔ 排隊者先使用，逾時者順延到他正後方（同時避開組員跨機台預約）
        * 3. 後面是時段預約、預約之後才有排隊 ➔ 把該排隊者拉到前面替補（需能在下一筆預約開始前用完）
-       * 4. 多裝置防護：執行前強制向資料庫查驗最新狀態，且所有 SQL 更新均附帶 status 與 started_at IS NULL 原子條件鎖，
+       * 4. 多裝置防護：執行前強制向資料庫查驗最新狀態，且所有 SQL 更新均附帶 status 原子條件鎖，
        *    徹底杜絕背景分頁或舊快照將「使用中」的預約打回「排隊中」！
        * @param overdue 逾時未報到的預約/排隊
        * @param snapshot 目前所有預約資料
@@ -1544,7 +1546,7 @@
         const freshSnapshot = freshRows.map(mapReservationRow);
         const freshOverdue = freshSnapshot.find(x => x.id === overdue.id);
 
-        // 若目標紀錄在資料庫已開始使用（使用中 / started_at 不為空）、已完成或已取消，立即中止！
+        // 若目標紀錄在資料庫已開始使用（使用中）、已完成或已取消，立即中止！
         if (!freshOverdue || hasReservationStartedOrInUse(freshOverdue)) {
           return false;
         }
@@ -1582,29 +1584,39 @@
         const queueList = allOtherQueues.filter(x => !isOverdueReleasedReservation(x));
         // 只有「尚未逾時」的時段預約需要讓路；已逾時的預約本身也會走這個流程
         const blockingSlots = waitingList
-          .filter(x => x.type === '時段預約' && x.startMinutes + graceMin > nowMinutes)
+          .filter(x => x.type === '時段預約' && !isOverdueReleasedReservation(x) && x.startMinutes + graceMin > nowMinutes)
           .sort((a, b) => a.startMinutes - b.startMinutes);
+        const blockingSlotRanges = blockingSlots.map(s => ({ start: s.startMinutes, end: s.endMinutes }));
 
         const fitsBeforeNextSlot = (dur) =>
           !blockingSlots.some(s => s.startMinutes < nowMinutes + dur && s.endMinutes > nowMinutes);
 
-        // 規則 1: 後方無可替補的現場排隊者 -> 釋放機台為空閒，並保留非空 called_at 標記已逾時釋放
+        // 規則 1: 後方無可替補的現場排隊者 -> 釋放機台為空閒，保留預約並將預計開始～結束時間同步更新至當前可用時間
         if (queueList.length === 0) {
           if (isOverdueReleasedReservation(freshOverdue)) {
             return false;
           }
 
+          const ovdDur = freshOverdue.durationMinutes || Math.max(10, (freshOverdue.endMinutes - freshOverdue.startMinutes) || 10);
+          const newStart = findEarliestValidStartForReservation(freshOverdue, nowMinutes, blockingSlotRanges, freshSnapshot, nowMinutes);
+          const newEnd = newStart + ovdDur;
           const releaseCalledAt = freshOverdue.calledAt || new Date().toISOString();
+
           const { data: releasedRows, error: relErr } = await supabaseClient
             .from('reservations')
             .update({
               status: '排隊中',
+              start_minutes: newStart,
+              end_minutes: newEnd,
+              start_time_formatted: minutesToTime(newStart),
+              end_time_formatted: minutesToTime(newEnd),
               called_at: releaseCalledAt,
+              started_at: null,
+              advance_offered_at: null,
               notes: '報到逾時，已釋放機台'
             })
             .eq('id', freshOverdue.id)
             .in('status', WAITING_RESERVATION_STATUSES)
-            .is('started_at', null)
             .select('id');
 
           if (relErr || !releasedRows || releasedRows.length === 0) {
@@ -1621,7 +1633,7 @@
               recipientName: (freshOverdue.students || []).join(', '),
               machineName: freshOverdue.machineName,
               subject: '【逾時未報到】機台已釋放',
-              body: `親愛的 ${(freshOverdue.students || []).join(', ')} 同學：您在【${freshOverdue.machineName}】超過 ${graceMin} 分鐘未報到，系統已釋放機台，請重新排隊或等候叫號。`
+              body: `親愛的 ${(freshOverdue.students || []).join(', ')} 同學：您在【${freshOverdue.machineName}】超過 ${graceMin} 分鐘未報到，系統已釋放機台並為您保留資格（預計時段更新為 ${minutesToTime(newStart)} ～ ${minutesToTime(newEnd)}）。`
             },
             ...prev
           ]);
@@ -1644,18 +1656,27 @@
           if (isOverdueReleasedReservation(freshOverdue)) {
             return false;
           }
-          // 後面排隊者全都有跨機台衝突：逾時者移開並標記已逾時釋放，機台設為空閒
+          // 後面排隊者全都有跨機台衝突：逾時者移開並更新預計時段、標記已逾時釋放，機台設為空閒
+          const ovdDur = freshOverdue.durationMinutes || Math.max(10, (freshOverdue.endMinutes - freshOverdue.startMinutes) || 10);
+          const newStart = findEarliestValidStartForReservation(freshOverdue, nowMinutes, blockingSlotRanges, freshSnapshot, nowMinutes);
+          const newEnd = newStart + ovdDur;
           const releaseCalledAt = freshOverdue.calledAt || new Date().toISOString();
+
           const { data: conflictRelRows, error: conflictRelErr } = await supabaseClient
             .from('reservations')
             .update({
               status: '排隊中',
+              start_minutes: newStart,
+              end_minutes: newEnd,
+              start_time_formatted: minutesToTime(newStart),
+              end_time_formatted: minutesToTime(newEnd),
               called_at: releaseCalledAt,
+              started_at: null,
+              advance_offered_at: null,
               notes: '報到逾時，候補者皆有時段衝突'
             })
             .eq('id', freshOverdue.id)
             .in('status', WAITING_RESERVATION_STATUSES)
-            .is('started_at', null)
             .select('id');
 
           if (conflictRelErr || !conflictRelRows || conflictRelRows.length === 0) {
@@ -1672,14 +1693,14 @@
         const restQueue = [freshOverdue, ...allOtherQueues.filter(q => q.id !== substitute.id)];
         const scheduledRanges = [
           { start: nowMinutes, end: subEnd },
-          ...blockingSlots.map(s => ({ start: s.startMinutes, end: s.endMinutes }))
+          ...blockingSlotRanges
         ];
         let runningStart = subEnd;
         let overdueNewStart = subEnd;
         const restPayloads = [];
 
         for (const item of restQueue) {
-          const dur = item.durationMinutes || 20;
+          const dur = item.durationMinutes || Math.max(10, (item.endMinutes - item.startMinutes) || 20);
           const candStart = findEarliestValidStartForReservation(item, runningStart, scheduledRanges, freshSnapshot, nowMinutes);
           const candEnd = candStart + dur;
           scheduledRanges.push({ start: candStart, end: candEnd });
@@ -1690,7 +1711,8 @@
             end_minutes: candEnd,
             start_time_formatted: minutesToTime(candStart),
             end_time_formatted: minutesToTime(candEnd),
-            called_at: null
+            called_at: null,
+            started_at: null
           };
           if (item.id === freshOverdue.id) {
             // NOTE: 時段預約逾時後就失去固定時段，改以現場排隊身分順延，後續沿用排隊叫號流程
@@ -1710,7 +1732,6 @@
           .update(overduePlan.payload)
           .eq('id', freshOverdue.id)
           .in('status', WAITING_RESERVATION_STATUSES)
-          .is('started_at', null)
           .select('id');
 
         if (updOvdErr || !updatedOverdueRows || updatedOverdueRows.length === 0) {
@@ -1727,11 +1748,11 @@
             start_time_formatted: minutesToTime(nowMinutes),
             end_time_formatted: minutesToTime(subEnd),
             called_at: new Date().toISOString(),
+            started_at: null,
             advance_offered_at: null
           })
           .eq('id', substitute.id)
           .in('status', WAITING_RESERVATION_STATUSES)
-          .is('started_at', null)
           .select('id');
 
         if (subErr || !calledSubRows || calledSubRows.length === 0) {
@@ -1754,8 +1775,7 @@
             .from('reservations')
             .update(entry.payload)
             .eq('id', entry.id)
-            .in('status', WAITING_RESERVATION_STATUSES)
-            .is('started_at', null);
+            .in('status', WAITING_RESERVATION_STATUSES);
         }
 
         await supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', freshOverdue.machineId);
@@ -1784,10 +1804,132 @@
         return true;
       };
 
+      /**
+       * 自動推進所有「時間已過但尚未按開始使用」之保留預約/排隊的預計開始與結束時間
+       * NOTE: 當預約超過開始時間仍未報到且後方無人時，預約會保留在候位清單中，
+       *       此函式確保其預計開始～結束時段隨當前時間即時往後更新（同時避開同機台固定預約與組員跨機台衝突）。
+       */
+      const syncStaleWaitingSchedules = useCallback(async (baseList, currentMin, graceMin, skipMachineIds = new Set()) => {
+        if (!supabaseClient || !Array.isArray(baseList) || baseList.length === 0) return false;
+
+        const byMac = new Map();
+        for (const r of baseList) {
+          if (!isReservationActive(r)) continue;
+          if (!byMac.has(r.machineId)) byMac.set(r.machineId, []);
+          byMac.get(r.machineId).push(r);
+        }
+
+        let changedAny = false;
+
+        for (const [macId, macList] of byMac.entries()) {
+          if (skipMachineIds.has(macId)) continue;
+
+          const inUse = macList.find(x => x.status === '使用中');
+          const checkingIn = macList.find(x => x.status === '等候報到' || x.status === '等候提前確認');
+          const waitingItems = macList
+            .filter(x => x.status === '排隊中' || x.status === '等待中')
+            .sort((a, b) => (a.startMinutes - b.startMinutes) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+
+          // 1. 若有「現場排隊」正在「等候報到」（3 分鐘緩衝內尚未按開始），且開始時間已落後於現在時間，同步更新預計時段（保留原 called_at 不變）
+          let effectiveCheckinEnd = checkingIn ? checkingIn.endMinutes : currentMin;
+          if (!inUse && checkingIn && checkingIn.status === '等候報到' && checkingIn.type === '現場排隊' && checkingIn.startMinutes < currentMin) {
+            const cDur = checkingIn.durationMinutes || Math.max(10, (checkingIn.endMinutes - checkingIn.startMinutes) || 10);
+            const fixedSlotsForCheckin = waitingItems
+              .filter(x => x.type === '時段預約' && !isOverdueReleasedReservation(x) && x.startMinutes + graceMin > currentMin)
+              .map(s => ({ start: s.startMinutes, end: s.endMinutes }));
+            const newCheckinStart = findEarliestValidStartForReservation(checkingIn, currentMin, fixedSlotsForCheckin, baseList, currentMin);
+            const newCheckinEnd = newCheckinStart + cDur;
+            effectiveCheckinEnd = newCheckinEnd;
+
+            if (newCheckinStart !== checkingIn.startMinutes || newCheckinEnd !== checkingIn.endMinutes) {
+              const { data: updChk } = await supabaseClient
+                .from('reservations')
+                .update({
+                  start_minutes: newCheckinStart,
+                  end_minutes: newCheckinEnd,
+                  start_time_formatted: minutesToTime(newCheckinStart),
+                  end_time_formatted: minutesToTime(newCheckinEnd),
+                  started_at: null
+                })
+                .eq('id', checkingIn.id)
+                .eq('status', '等候報到')
+                .select('id');
+              if (updChk && updChk.length > 0) {
+                changedAny = true;
+              }
+            }
+          }
+
+          if (waitingItems.length === 0) continue;
+
+          // 2. 區分「尚未逾時的固定時段預約」與「需隨時間推進預計時段的排隊/保留預約」
+          const fixedValidSlots = waitingItems.filter(
+            x => x.type === '時段預約' && !isOverdueReleasedReservation(x) && x.startMinutes + graceMin > currentMin
+          );
+          const rollingItems = waitingItems.filter(x => !fixedValidSlots.includes(x));
+          if (rollingItems.length === 0) continue;
+
+          let machineBaseMin = currentMin;
+          if (inUse) {
+            machineBaseMin = Math.max(machineBaseMin, inUse.endMinutes, currentMin + 1);
+          }
+          if (checkingIn) {
+            machineBaseMin = Math.max(machineBaseMin, effectiveCheckinEnd);
+          }
+
+          const scheduledRanges = fixedValidSlots.map(s => ({ start: s.startMinutes, end: s.endMinutes }));
+          if (inUse) {
+            scheduledRanges.push({ start: Math.min(inUse.startMinutes, currentMin), end: Math.max(inUse.endMinutes, currentMin + 1) });
+          }
+          if (checkingIn) {
+            scheduledRanges.push({ start: Math.min(checkingIn.startMinutes, currentMin), end: effectiveCheckinEnd });
+          }
+
+          let runningStart = machineBaseMin;
+          for (const item of rollingItems) {
+            const dur = item.durationMinutes || Math.max(10, (item.endMinutes - item.startMinutes) || 10);
+            const minCandidate = isOverdueReleasedReservation(item)
+              ? runningStart
+              : Math.max(runningStart, item.startMinutes);
+            const candStart = findEarliestValidStartForReservation(item, minCandidate, scheduledRanges, baseList, currentMin);
+            const candEnd = candStart + dur;
+            scheduledRanges.push({ start: candStart, end: candEnd });
+            runningStart = candEnd;
+
+            if (candStart !== item.startMinutes || candEnd !== item.endMinutes || Boolean(item.startedAt)) {
+              const updatePayload = {
+                start_minutes: candStart,
+                end_minutes: candEnd,
+                start_time_formatted: minutesToTime(candStart),
+                end_time_formatted: minutesToTime(candEnd),
+                started_at: null
+              };
+              if (Boolean(item.startedAt) && !item.calledAt) {
+                updatePayload.called_at = item.startedAt;
+              }
+
+              const { data: updWait } = await supabaseClient
+                .from('reservations')
+                .update(updatePayload)
+                .eq('id', item.id)
+                .in('status', ['排隊中', '等待中'])
+                .select('id');
+
+              if (updWait && updWait.length > 0) {
+                changedAny = true;
+              }
+            }
+          }
+        }
+
+        return changedAny;
+      }, []);
+
       // NOTE: 自動逾時掃描機制（每 8 秒自動輪詢）
-      // 1. 現場排隊叫號逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留）
+      // 1. 現場排隊叫號逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留並更新預計時段）
       // 2. 時段預約提前詢問 3 分鐘未回應 ➔ 保留原時段、叫下一位
-      // 3. 時段預約開始後逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留）
+      // 3. 時段預約開始後逾時未報到 ➔ 交給 handleOverdueReservation（有人可替補就順延，沒有就保留並更新預計時段）
+      // 4. 時間已過但尚未按開始的保留預約 ➔ 自動透過 syncStaleWaitingSchedules 即時更新預計開始與結束時間
       useEffect(() => {
         const scanTimeout = async () => {
           if (!supabaseClient || isCoursePaused) return;
@@ -1818,10 +1960,6 @@
 
             for (const r of scanList) {
               // 規則 0: 使用中的同學超過結束時間 -> 自動結束使用，並連動叫下一位、更新機台狀態
-              // NOTE: 多台裝置（手機、電視）都會跑這個掃描，因此用「狀態仍為使用中 且 資料庫中的結束時間已到」
-              //       當條件更新，只有第一個成功的裝置會繼續叫號，避免重複叫號與重複通知。
-              //       以資料庫的 end_minutes 判斷（而非本機快照），也避免恢復課程順延時間時，
-              //       用到尚未更新的舊快照而誤判逾時。
               if (r.status === '使用中' && typeof r.endMinutes === 'number' && currentMin >= r.endMinutes) {
                 const { data: stopped, error: stopError } = await supabaseClient
                   .from('reservations')
@@ -1860,7 +1998,7 @@
                 continue;
               }
 
-              // 規則 1: 現場排隊等候報到逾時 -> 有人可替補就順延，沒有就保留資格
+              // 規則 1: 現場排隊等候報到逾時 -> 有人可替補就順延，沒有就保留資格並更新預計時段
               if (r.type === '現場排隊' && r.status === '等候報到' && r.calledAt && !hasReservationStartedOrInUse(r)) {
                 const calledTime = new Date(r.calledAt).getTime();
                 if (now.getTime() - calledTime >= graceMs && !swappedMachines.has(r.machineId)) {
@@ -1874,7 +2012,6 @@
               }
 
               // 規則 1b: 現場排隊排在首位，但時段結束時間已過且尚未開始使用（逾期未報到）
-              // 例如排定 17:36~17:46，現在已過 17:46 卻未開機，立即視為逾期順延給下一位
               if (r.type === '現場排隊' && (r.status === '等候報到' || r.status === '排隊中') && !hasReservationStartedOrInUse(r) && !swappedMachines.has(r.machineId)) {
                 const sameMacActive = scanList.filter(x => x.machineId === r.machineId && (x.status === '使用中' || x.status === '等候報到' || x.status === '排隊中'));
                 const isFirst = sameMacActive.sort((a, b) => a.startMinutes - b.startMinutes)[0]?.id === r.id;
@@ -1882,7 +2019,6 @@
                 const hasUnreleasedSubstitute = sameMacActive.some(
                   x => x.id !== r.id && x.type === '現場排隊' && !hasReservationStartedOrInUse(x) && !isOverdueReleasedReservation(x)
                 );
-                // 若已是逾時釋放狀態且後方沒有其他未逾時候補者，不再每輪重複釋放
                 if (isFirst && !macInUse && currentMin >= r.endMinutes && (!isOverdueReleasedReservation(r) || hasUnreleasedSubstitute)) {
                   console.log(`[Queue-Expired] 現場排隊時段已過期未報到，直接順延換下一位：${r.machineName}`);
                   const swapped = await handleOverdueReservation(r, scanList, currentMin, graceMin);
@@ -1908,7 +2044,6 @@
                       })
                       .eq('id', r.id)
                       .eq('status', '等候提前確認')
-                      .is('started_at', null)
                       .select('id');
 
                     if (!revErr && revertedOffer && revertedOffer.length > 0) {
@@ -1930,7 +2065,7 @@
                 }
               }
 
-              // 規則 3: 時段預約超過開始時間仍未報到 -> 有人可替補就順延，沒有就保留資格
+              // 規則 3: 時段預約超過開始時間仍未報到 -> 有人可替補就順延，沒有就保留資格並更新預計時段
               if (r.type === '時段預約' && (r.status === '排隊中' || r.status === '等候報到') && !hasReservationStartedOrInUse(r)) {
                 const hasUnreleasedSubstitute = scanList.some(
                   x => x.machineId === r.machineId && x.id !== r.id && x.type === '現場排隊' && WAITING_RESERVATION_STATUSES.includes(x.status) && !isOverdueReleasedReservation(x)
@@ -1977,6 +2112,13 @@
               await advanceQueueForMachine(macId);
             }
 
+            // 規則 4: 針對尚未按開始但預計開始時間已落後於目前時間的保留排隊預約，自動跟著更新預計開始與結束時間
+            const skipIds = new Set([...swappedMachines, ...machinesToAdvance]);
+            const syncedSchedules = await syncStaleWaitingSchedules(scanList, currentMin, graceMin, skipIds);
+            if (syncedSchedules) {
+              updatedAny = true;
+            }
+
             if (updatedAny) {
               await refreshData();
             }
@@ -1985,9 +2127,13 @@
           }
         };
 
+        const initialTimer = setTimeout(scanTimeout, 800);
         const timer = setInterval(scanTimeout, 8000);
-        return () => clearInterval(timer);
-      }, [reservations, isCoursePaused, systemSettings, refreshData, activeUser]);
+        return () => {
+          clearTimeout(initialTimer);
+          clearInterval(timer);
+        };
+      }, [reservations, isCoursePaused, systemSettings, refreshData, activeUser, syncStaleWaitingSchedules, advanceQueueForMachine]);
 
       // NOTE: 每 30 秒掃描一次，對距離開始 4~6 分鐘內的預約發送「時段前 5 分鐘提醒」通知
       // 僅通知目前登入者自己的預約，並用 localStorage 防止重複推播
@@ -2498,6 +2644,7 @@
             end_time_formatted: item.endTimeFormatted,
             status: newStatus,
             called_at: calledAt,
+            started_at: null,
             advance_offered_at: null
           };
           updates.push(
@@ -2506,7 +2653,6 @@
               .update(payload)
               .eq('id', item.id)
               .in('status', WAITING_RESERVATION_STATUSES)
-              .is('started_at', null)
           );
         }
 
@@ -2592,11 +2738,11 @@
               start_minutes: item.startMinutes,
               end_minutes: item.endMinutes,
               start_time_formatted: item.startTimeFormatted,
-              end_time_formatted: item.endTimeFormatted
+              end_time_formatted: item.endTimeFormatted,
+              started_at: null
             })
             .eq('id', item.id)
             .in('status', WAITING_RESERVATION_STATUSES)
-            .is('started_at', null)
         );
         await Promise.all(updates);
         await refreshData();
