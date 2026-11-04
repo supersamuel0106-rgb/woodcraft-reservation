@@ -1135,6 +1135,49 @@
           const swappedMachines = new Set();
 
           for (const r of reservations) {
+            // 規則 0: 使用中的同學超過結束時間 -> 自動結束使用，並連動叫下一位、更新機台狀態
+            // NOTE: 多台裝置（手機、電視）都會跑這個掃描，因此用「狀態仍為使用中 且 資料庫中的結束時間已到」
+            //       當條件更新，只有第一個成功的裝置會繼續叫號，避免重複叫號與重複通知。
+            //       以資料庫的 end_minutes 判斷（而非本機快照），也避免恢復課程順延時間時，
+            //       用到尚未更新的舊快照而誤判逾時。
+            if (r.status === '使用中' && typeof r.endMinutes === 'number' && currentMin >= r.endMinutes) {
+              const { data: stopped, error: stopError } = await supabaseClient
+                .from('reservations')
+                .update({ status: '已完成', finished_at: now.toISOString() })
+                .eq('id', r.id)
+                .eq('status', '使用中')
+                .lte('end_minutes', currentMin)
+                .select('id');
+
+              if (stopError) {
+                console.error('[Auto-Stop] 自動結束失敗:', stopError);
+              } else if (stopped && stopped.length > 0) {
+                console.log(`[Auto-Stop] 使用時間已到，自動結束：${r.machineName}（${(r.students || []).join(', ')}）`);
+
+                const isMine = (r.students || []).includes(activeUser?.name) ||
+                  (r.email && activeUser?.mail && r.email.toLowerCase() === activeUser.mail.toLowerCase());
+                if (isMine) {
+                  const stopTitle = `【使用時間已到⏱️】${r.machineName}`;
+                  const stopBody = `您在【${r.machineName}】的使用時間（${r.startTimeFormatted} ～ ${r.endTimeFormatted}）已結束，系統已自動停止使用並交給下一位，請盡快將機台整理乾淨。`;
+                  sendBrowserNotification(stopTitle, stopBody, `auto-stop-${r.id}`);
+                  setNotifications(prev => [{
+                    id: `N_${Date.now()}_${r.id}`,
+                    timestamp: now.toLocaleTimeString('zh-TW'),
+                    recipientName: (r.students || []).join(', '),
+                    machineName: r.machineName,
+                    subject: '【使用時間已到】系統已自動結束',
+                    body: stopBody
+                  }, ...prev]);
+                }
+
+                // 連動：叫下一位（現場排隊直接叫號、時段預約發提前詢問），並更新機台狀態
+                await advanceQueueForMachine(r.machineId, reservations.filter(x => x.id !== r.id));
+                swappedMachines.add(r.machineId);
+                updatedAny = true;
+              }
+              continue;
+            }
+
             // 規則 1: 現場排隊等候報到逾時 -> 有人可替補就順延，沒有就保留資格
             if (r.type === '現場排隊' && r.status === '等候報到' && r.calledAt) {
               const calledTime = new Date(r.calledAt).getTime();
