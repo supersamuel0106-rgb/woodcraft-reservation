@@ -4467,13 +4467,17 @@
      * 當多人預約（例如 2 人以上）文字超出卡片邊界時，自動啟動無縫循環跑馬燈，
      * 開頭停留約 3 秒方便辨識，隨後絲滑平移展示完整名單，避免文字被「…」截斷。
      */
-    function TvMarqueeText({ text, style, className }) {
+    function TvMarqueeText({ text, style, className, forceMarquee }) {
       const containerRef = useRef(null);
       const textRef = useRef(null);
       const [isOverflow, setIsOverflow] = useState(false);
 
       useEffect(() => {
         const check = () => {
+          if (forceMarquee) {
+            setIsOverflow(true);
+            return;
+          }
           if (containerRef.current && textRef.current) {
             const textWidth = textRef.current.scrollWidth;
             const containerWidth = containerRef.current.clientWidth;
@@ -4496,7 +4500,7 @@
           if (ro) ro.disconnect();
           window.removeEventListener('resize', check);
         };
-      }, [text]);
+      }, [text, forceMarquee]);
 
       const animDuration = useMemo(() => {
         const len = (text || '').length;
@@ -4570,6 +4574,7 @@
               <span style={{ width: 24, height: 24, borderRadius: '50%', background: theme.dot, flexShrink: 0 }} />
               <TvMarqueeText
                 text={card.title}
+                forceMarquee={card.isMultiple}
                 style={{ fontSize: 42, fontWeight: 800, color: '#111', minWidth: 0, flexShrink: 1 }}
               />
               {card.timeText && (
@@ -4618,6 +4623,7 @@
                       <span style={{ fontSize: 22, fontWeight: 600, color: '#222', whiteSpace: 'nowrap', flexShrink: 0 }}>{row.timeText}</span>
                       <TvMarqueeText
                         text={row.names}
+                        forceMarquee={row.isMultiple}
                         style={{ fontSize: 22, fontWeight: 600, color: '#222', flex: 1, minWidth: 0 }}
                       />
                       <TvReservationBadge typeLabel={row.typeLabel} color={theme.dot} />
@@ -4697,13 +4703,15 @@
           const statusKey = inUse ? 'busy' : machine.status === '等待報到' ? 'waiting' : 'idle';
           const title = inUse ? (inUse.students || []).join('、') : statusKey === 'waiting' ? '等待中' : '空閒中';
           const timeText = inUse ? `${inUse.startTimeFormatted}-${inUse.endTimeFormatted}` : '';
+          const isMultiple = Boolean(inUse && ((inUse.students || []).length >= 2 || (inUse.students || []).join('、').includes('、')));
 
           return {
-            id: machine.id, col, row, statusKey, title, timeText,
+            id: machine.id, col, row, statusKey, title, timeText, isMultiple,
             base: parsed.base, tag: parsed.tag,
             rows: upcoming.slice(0, 2).map(r => ({
               timeText: `${r.startTimeFormatted}-${r.endTimeFormatted}`,
               names: (r.students || []).join('、'),
+              isMultiple: (r.students || []).length >= 2 || (r.students || []).join('、').includes('、'),
               typeLabel: r.type === '時段預約' ? '預約' : '排隊'
             }))
           };
@@ -4718,9 +4726,12 @@
           .map(r => {
             const machine = machines.find(m => m.id === r.machineId);
             const parsed = parseTvMachineName(machine ? machine.name : r.machineName);
+            const studentCount = (r.students || []).length;
+            const isMultiple = studentCount >= 2 || (r.students || []).join('、').includes('、');
             return {
               id: r.id,
               names: (r.students || []).join('、'),
+              isMultiple,
               timeText: `${r.startTimeFormatted}-${r.endTimeFormatted}`,
               typeLabel: r.type === '時段預約' ? '預約' : '排隊',
               tag: parsed.tag,
@@ -4822,7 +4833,16 @@
                       </span>
                       <TvMarqueeText
                         text={item.names}
-                        style={{ fontSize: 36, fontWeight: 800, color: '#111', minWidth: 0, flexShrink: 1 }}
+                        forceMarquee={item.isMultiple}
+                        style={{
+                          fontSize: 36,
+                          fontWeight: 800,
+                          color: '#111',
+                          width: 250,
+                          minWidth: 250,
+                          maxWidth: 250,
+                          flexShrink: 0
+                        }}
                       />
                       <span style={{ fontSize: 32, fontWeight: 700, whiteSpace: 'nowrap', flexShrink: 0 }}>{item.timeText}</span>
                       <span style={{ flex: 1, height: 2, background: '#8a8a8a', minWidth: 20 }} />
