@@ -4286,12 +4286,16 @@
       );
     }
 
-    function TvReservationBadge({ typeLabel }) {
-      const isSlot = typeLabel === '預約';
+    /**
+     * 卡片內的「預約 / 排隊」標籤
+     * @param typeLabel 標籤文字
+     * @param color 標籤底色，傳入該機台的狀態色（橘 / 紅 / 綠），讓整張卡片視覺一致
+     */
+    function TvReservationBadge({ typeLabel, color }) {
       return (
         <span
           style={{
-            background: isSlot ? '#F5A55B' : '#E8727C',
+            background: color,
             color: '#fff', fontSize: 15, fontWeight: 700, lineHeight: 1,
             padding: '5px 12px', borderRadius: 999, flexShrink: 0
           }}
@@ -4366,7 +4370,7 @@
                       <span style={{ fontSize: 22, fontWeight: 600, color: '#222', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {row.names}
                       </span>
-                      <TvReservationBadge typeLabel={row.typeLabel} />
+                      <TvReservationBadge typeLabel={row.typeLabel} color={theme.dot} />
                     </>
                   )}
                 </div>
