@@ -122,21 +122,55 @@
     const AUTH_STORAGE_KEY = 'factory_v04_logged_in_email';
     const supabaseClient = window.supabase?.createClient ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-    // NOTE: reservations 表目前缺少 advance_offered_at / notes 欄位。
-    //       程式多處更新預約時（叫號、保留時段…）會一併寫入這兩欄，資料庫會「整筆更新被拒絕」，
-    //       且 Supabase 只回傳 error、不會丟例外，結果預約狀態永遠停在「排隊中」、看板不會變橘色。
-    //       因此在寫入層統一略過資料庫沒有的欄位；refreshData 偵測到欄位存在時會自動恢復寫入。
+    // NOTE: reservations 表目前缺少 advance_offered_at / notes 欄位，且 status (enum reservation_status)
+    //       僅包含 ['等候報到', '排隊中', '等待中', '使用中', '已完成', '已取消']（不含「等候提前確認」）。
+    //       若更新或查詢條件 (.in / .eq) 傳入缺少的欄位或未定義的 enum 值，PostgreSQL 會回傳 400 (22P02) 整筆拒絕，
+    //       導致新建立的排隊永遠停在「排隊中」、機台與電視看板不會變橘色（等待報到）。
+    //       因此在資料存取層統一剝離缺少欄位並正規化 status 枚舉值。
     const MISSING_RESERVATION_COLUMNS = new Set(['advance_offered_at', 'notes']);
+    const VALID_DB_RESERVATION_STATUSES = new Set(['等候報到', '排隊中', '等待中', '使用中', '已完成', '已取消']);
+
+    function normalizeDbReservationStatus(status) {
+      if (status === '等候提前確認') return '等候報到';
+      return status;
+    }
+
+    function normalizeDbReservationStatusList(statuses) {
+      if (!Array.isArray(statuses)) return statuses;
+      const mapped = statuses
+        .map(normalizeDbReservationStatus)
+        .filter(s => VALID_DB_RESERVATION_STATUSES.has(s));
+      return Array.from(new Set(mapped));
+    }
 
     function stripMissingReservationColumns(values) {
-      if (MISSING_RESERVATION_COLUMNS.size === 0) return values;
       const strip = (row) => {
         if (!row || typeof row !== 'object') return row;
         const copy = { ...row };
+        if (copy.status === '等候提前確認') {
+          copy.status = '等候報到';
+          if (copy.advance_offered_at && copy.called_at === undefined) {
+            copy.called_at = copy.advance_offered_at;
+          }
+        }
         MISSING_RESERVATION_COLUMNS.forEach(col => { delete copy[col]; });
         return copy;
       };
       return Array.isArray(values) ? values.map(strip) : strip(values);
+    }
+
+    function wrapReservationFilterBuilder(fb) {
+      if (!fb || typeof fb !== 'object' || fb.__statusWrapped) return fb;
+      Object.defineProperty(fb, '__statusWrapped', { value: true, enumerable: false });
+      if (typeof fb.in === 'function') {
+        const origIn = fb.in.bind(fb);
+        fb.in = (col, vals) => origIn(col, col === 'status' ? normalizeDbReservationStatusList(vals) : vals);
+      }
+      if (typeof fb.eq === 'function') {
+        const origEq = fb.eq.bind(fb);
+        fb.eq = (col, val) => origEq(col, col === 'status' ? normalizeDbReservationStatus(val) : val);
+      }
+      return fb;
     }
 
     if (supabaseClient) {
@@ -144,10 +178,15 @@
       supabaseClient.from = (table) => {
         const builder = originalFrom(table);
         if (table === 'reservations') {
+          wrapReservationFilterBuilder(builder);
           const originalUpdate = builder.update.bind(builder);
           const originalInsert = builder.insert.bind(builder);
-          builder.update = (values, options) => originalUpdate(stripMissingReservationColumns(values), options);
-          builder.insert = (values, options) => originalInsert(stripMissingReservationColumns(values), options);
+          const originalSelect = typeof builder.select === 'function' ? builder.select.bind(builder) : null;
+          const originalDelete = typeof builder.delete === 'function' ? builder.delete.bind(builder) : null;
+          builder.update = (values, options) => wrapReservationFilterBuilder(originalUpdate(stripMissingReservationColumns(values), options));
+          builder.insert = (values, options) => wrapReservationFilterBuilder(originalInsert(stripMissingReservationColumns(values), options));
+          if (originalSelect) builder.select = (...args) => wrapReservationFilterBuilder(originalSelect(...args));
+          if (originalDelete) builder.delete = (...args) => wrapReservationFilterBuilder(originalDelete(...args));
         }
         return builder;
       };
@@ -493,7 +532,8 @@
       return nowMinutes + duration;
     }
 
-    const WAITING_RESERVATION_STATUSES = ['等候報到', '等候提前確認', '排隊中', '等待中'];
+    // NOTE: 僅包含資料庫 enum reservation_status 支援的等候狀態枚舉值，避免 .in('status', ...) 觸發 PostgreSQL 22P02 錯誤
+    const WAITING_RESERVATION_STATUSES = ['等候報到', '排隊中', '等待中'];
 
     /**
      * 將資料庫 reservations 資料列統一映射為前端預約物件
@@ -548,6 +588,21 @@
       if (!r || r.status !== '排隊中') return false;
       if (typeof r.notes === 'string' && r.notes.includes('報到逾時')) return true;
       return Boolean(r.calledAt || r.called_at || r.startedAt || r.started_at);
+    }
+
+    /**
+     * 判斷「等候報到」的預約是否已超過報到寬限時間（預設 3 分鐘）
+     * @param {Object} r 預約物件
+     * @param {number} graceMin 報到寬限分鐘數
+     * @returns {boolean}
+     */
+    function isCheckinCallExpired(r, graceMin = 3) {
+      if (!r || r.status !== '等候報到') return false;
+      const cAt = r.calledAt || r.called_at;
+      if (!cAt) return false;
+      const calledMs = new Date(cAt).getTime();
+      if (isNaN(calledMs)) return false;
+      return (Date.now() - calledMs) >= graceMin * 60 * 1000;
     }
 
     /**
@@ -735,11 +790,24 @@
 
         // 2. 檢查名單內所有組員在其他機台準備使用或使用中的時段
         const itemIsOverdueReleased = isOverdueReleasedReservation(item);
+        const itemHasId = Boolean(item.id);
         for (const { start, end, reservation: r, isOverdueReleased } of busyIntervals) {
           if (r.id === item.id) continue;
           if (r.machineId === item.machineId) continue;
           // 正常預約計算時，其他機台已逾時釋放的保留單會自動往後讓開，不阻擋正常預約
           if (!itemIsOverdueReleased && isOverdueReleased) continue;
+          // NOTE: 若 item 為既有排隊，而另一機台的 r 也是尚未被叫號的浮動現場排隊且排在 item 之後，
+          //       先排的 item 不向後排的 r 禮讓蛙跳，而是由後排的 r 接在 item 之後，避免兩機台時段互相推高至數小時後
+          if (
+            itemHasId &&
+            !itemIsOverdueReleased &&
+            r.type === '現場排隊' &&
+            (r.status === '排隊中' || r.status === '等待中')
+          ) {
+            const rLaterByStart = typeof r.startMinutes === 'number' && typeof item.startMinutes === 'number' && r.startMinutes > item.startMinutes;
+            const rLaterByCreated = r.startMinutes === item.startMinutes && item.createdAt && r.createdAt && String(r.createdAt) > String(item.createdAt);
+            if (rLaterByStart || rLaterByCreated) continue;
+          }
           if (!(start < candEnd && end > candStart)) continue;
 
           const matched = getOverlappingStudentNames(r, studentSet, item.email);
@@ -782,30 +850,45 @@
           return { canStart: false, reason: `尚未到預約時段！您的時段為 ${target.startTimeFormatted} ～ ${target.endTimeFormatted}，請於時段開始後再按開始。` };
         }
       } else {
-        // 現場排隊：檢查叫號是否已超過報到寬限期（且後面有人等待時不可搶開）
-        if (target.status === '等候報到' && target.calledAt) {
-          const calledTime = new Date(target.calledAt).getTime();
-          const graceMin = 3;
-          const hasOtherWaiters = sameMachine.some(r => WAITING_STATUSES.includes(r.status));
-          if (hasOtherWaiters && Date.now() - calledTime >= graceMin * 60 * 1000) {
-            return { canStart: false, reason: `已超過 ${graceMin} 分鐘報到寬限時間！系統已將機會順延給下一位同學。` };
-          }
+        const graceMin = 3;
+        // 現場排隊：檢查叫號是否已超過報到寬限期（且後面有其他未逾時候補者等待時不可搶開）
+        const hasOtherWaiters = sameMachine.some(
+          r => WAITING_STATUSES.includes(r.status) && !isOverdueReleasedReservation(r) && !isCheckinCallExpired(r, graceMin)
+        );
+        if (isCheckinCallExpired(target, graceMin) && hasOtherWaiters) {
+          return { canStart: false, reason: `已超過 ${graceMin} 分鐘報到寬限時間！系統已將機會順延給下一位同學。` };
         }
 
-        // 現場排隊：排序在自己之前、仍在等候的人都算「前面有人」
+        // 現場排隊：排序在自己之前、仍在等候且「尚未超過 3 分鐘報到期限」的人算前面有人；
+        // 若前面的人已超過 3 分鐘報到期限或已逾時釋放，下一位候補者可直接按開始使用！
         const ahead = sameMachine
-          .filter(r => WAITING_STATUSES.includes(r.status) && r.startMinutes < target.startMinutes)
+          .filter(r =>
+            WAITING_STATUSES.includes(r.status) &&
+            !isOverdueReleasedReservation(r) &&
+            !isCheckinCallExpired(r, graceMin) &&
+            (r.startMinutes < target.startMinutes || (r.startMinutes === target.startMinutes && String(r.createdAt || '') < String(target.createdAt || '')))
+          )
           .sort((a, b) => a.startMinutes - b.startMinutes)[0];
         if (ahead) {
           return { canStart: false, reason: `前面還有【${(ahead.students || []).join(', ')}】（${ahead.startTimeFormatted} ～ ${ahead.endTimeFormatted}）尚未使用，請依順序等候叫號。` };
         }
       }
 
-      // 檢查名單中所有組員此刻在其他機台是否有正在使用或重疊的準備使用時段
+      // 檢查名單中所有組員此刻在其他機台是否有正在使用、或排在更前面的準備使用時段
+      // （忽略其他機台已逾時超過 3 分鐘或排在本筆之後的浮動現場排隊，避免兩機台互鎖導致無法按開始）
+      const eligibleCheckReservations = (reservations || []).filter(r => {
+        if (r.id === target.id || r.machineId === target.machineId) return true;
+        if (r.status === '使用中') return true;
+        if (isCheckinCallExpired(r, 3) || isOverdueReleasedReservation(r)) return false;
+        if (r.type === '現場排隊' && (r.status === '排隊中' || r.status === '等待中')) {
+          return false;
+        }
+        return true;
+      });
       const usageEnd = calculateUsageEndMinutes(target, nowMinutes);
       const usageDur = Math.max(1, usageEnd - nowMinutes);
       const crossConflict = findStudentConflict(
-        reservations,
+        eligibleCheckReservations,
         target.students,
         target.email,
         nowMinutes,
@@ -825,6 +908,36 @@
       }
 
       return { canStart: true, reason: '' };
+    }
+
+    /**
+     * 判斷預約或排隊是否「當下就可以開始使用，但還沒按開始」
+     * NOTE: 只要符合此條件（無論狀態為「等候報到」或剛建立/保留中的「排隊中」），
+     *       機台與電視看板皆應立即顯示橘色（等待報到 / 等待中）。
+     * @param {Object} r 預約物件
+     * @param {Array<Object>} allReservations 所有預約清單
+     * @param {number} nowMinutes 目前時間（分鐘）
+     * @returns {boolean}
+     */
+    function isReservationReadyToStartNow(r, allReservations, nowMinutes) {
+      if (!r || hasReservationStartedOrInUse(r)) return false;
+      const WAITING_ALL = ['等候報到', '等候提前確認', '排隊中', '等待中'];
+      if (!WAITING_ALL.includes(r.status)) return false;
+
+      const sameMachineInUse = (allReservations || []).some(
+        x => x.machineId === r.machineId && x.status === '使用中'
+      );
+      if (sameMachineInUse) return false;
+
+      if (r.status === '等候報到' || r.status === '等候提前確認') {
+        return true;
+      }
+
+      if (typeof r.startMinutes === 'number' && r.startMinutes > nowMinutes) {
+        return false;
+      }
+
+      return getStartEligibility(r, allReservations || [], nowMinutes).canStart;
     }
 
     /**
@@ -1156,9 +1269,15 @@
           const rawStudents = (sRes.data || []).map(row => ({ id: row.id, name: row.name, studentNumber: row.student_number, mail: row.mail, role: row.role }));
           const rawSessions = (csRes.data || []).map(row => ({ id: row.id, sessionId: row.session_id, startTime: row.start_time, endTime: row.end_time, isCurrent: row.is_current, notes: row.notes }));
 
+          const nowForMac = new Date();
+          const nowMinForMac = nowForMac.getHours() * 60 + nowForMac.getMinutes();
+
           const updatedMachines = rawMachines.map(mac => {
             const inUse = rawReservations.find(r => r.machineId === mac.id && r.status === '使用中');
-            const waitCheckin = rawReservations.find(r => r.machineId === mac.id && (r.status === '等候報到' || r.status === '等候提前確認'));
+            // NOTE: 只要機台有「等候報到」或「當下就可以開始使用但還沒按開始」的預約/排隊，立即顯示橘色（等待報到）
+            const waitCheckin = rawReservations.find(
+              r => r.machineId === mac.id && isReservationReadyToStartNow(r, rawReservations, nowMinForMac)
+            );
             const nextW = getNextQueueWaiter(rawReservations, mac.id);
 
             let computed = '空閒';
@@ -1210,7 +1329,24 @@
 
       useEffect(() => {
         refreshData();
-        const timer = setInterval(refreshData, 8000);
+        const timer = setInterval(refreshData, 3000);
+        // NOTE: 啟用 Supabase Realtime 即時監聽，任何裝置建立排隊或變更狀態時，電視看板與手機端立即同步變色
+        let realtimeChannel = null;
+        if (supabaseClient && typeof supabaseClient.channel === 'function') {
+          try {
+            realtimeChannel = supabaseClient
+              .channel('woodcraft-live-sync')
+              .on('postgres_changes', { event: '*', schema: 'public', table: 'reservations' }, () => {
+                refreshData();
+              })
+              .on('postgres_changes', { event: '*', schema: 'public', table: 'machines' }, () => {
+                refreshData();
+              })
+              .subscribe();
+          } catch (e) {
+            console.warn('Realtime channel setup skipped:', e);
+          }
+        }
         // NOTE: 當手機螢幕喚醒或分頁從背景切回前景時，立即拉取最新資料庫狀態，消除背景凍結期間的舊快照
         const handleVisibilityOrFocus = () => {
           if (typeof document === 'undefined' || document.visibilityState === 'visible') {
@@ -1221,6 +1357,9 @@
         document.addEventListener('visibilitychange', handleVisibilityOrFocus);
         return () => {
           clearInterval(timer);
+          if (realtimeChannel && typeof supabaseClient?.removeChannel === 'function') {
+            supabaseClient.removeChannel(realtimeChannel);
+          }
           window.removeEventListener('focus', handleVisibilityOrFocus);
           document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
         };
@@ -1623,7 +1762,9 @@
             return false;
           }
 
-          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', freshOverdue.machineId);
+          // NOTE: 若更新時段後當下即可開始使用（還沒按開始），機台應保持橘色「等待報到」而非綠色「空閒」
+          const releasedMacStatus = newStart <= nowMinutes ? '等待報到' : '空閒';
+          await supabaseClient.from('machines').update({ status: releasedMacStatus }).eq('id', freshOverdue.machineId);
 
           const stamp = new Date().toLocaleTimeString('zh-TW');
           setNotifications(prev => [
@@ -1640,16 +1781,25 @@
           return true;
         }
 
-        // 找第一位「現在就能用完、且名單中所有組員在其他機台沒有衝突」的排隊者
+        // 找第一位「現在就能用完、且名單中所有組員在其他機台沒有真正忙碌衝突」的排隊者
+        // NOTE: 忽略其他機台已逾時超過 3 分鐘或尚未被叫號的浮動「排隊中」預約，避免候補者因別台排隊而被卡死無法替補
+        const activeSnapshotForSub = freshSnapshot.filter(r => {
+          if (r.machineId === freshOverdue.machineId) return true;
+          if (r.status === '使用中') return true;
+          if (isCheckinCallExpired(r, graceMin) || isOverdueReleasedReservation(r)) return false;
+          if (r.type === '現場排隊' && (r.status === '排隊中' || r.status === '等待中')) return false;
+          return true;
+        });
+
         let substitute = queueList.find(q => {
           const dur = q.durationMinutes || 20;
           if (!fitsBeforeNextSlot(dur)) return false;
-          return !findStudentConflict(freshSnapshot, q.students, q.email, nowMinutes, dur, q.id, freshOverdue.machineId, nowMinutes);
+          return !findStudentConflict(activeSnapshotForSub, q.students, q.email, nowMinutes, dur, q.id, freshOverdue.machineId, nowMinutes);
         });
 
-        // 若因時段塞不下但後面確實有候補人，直接取第一位無跨機台衝突者替補
+        // 若因時段塞不下但後面確實有候補人，直接取第一位無跨機台使用中衝突者替補
         if (!substitute) {
-          substitute = queueList.find(q => !findStudentConflict(freshSnapshot, q.students, q.email, nowMinutes, q.durationMinutes || 20, q.id, freshOverdue.machineId, nowMinutes));
+          substitute = queueList.find(q => !findStudentConflict(activeSnapshotForSub, q.students, q.email, nowMinutes, q.durationMinutes || 20, q.id, freshOverdue.machineId, nowMinutes));
         }
 
         if (!substitute) {
@@ -1683,7 +1833,8 @@
             return false;
           }
 
-          await supabaseClient.from('machines').update({ status: '空閒' }).eq('id', freshOverdue.machineId);
+          const conflictMacStatus = newStart <= nowMinutes ? '等待報到' : '空閒';
+          await supabaseClient.from('machines').update({ status: conflictMacStatus }).eq('id', freshOverdue.machineId);
           return true;
         }
 
@@ -1888,7 +2039,8 @@
           let runningStart = machineBaseMin;
           for (const item of rollingItems) {
             const dur = item.durationMinutes || Math.max(10, (item.endMinutes - item.startMinutes) || 10);
-            const minCandidate = isOverdueReleasedReservation(item)
+            // NOTE: 現場排隊直接從本機台可用起點 runningStart 推算最早無衝突時段，不再鎖死歷史推高值，避免跨機台蛙跳至數小時後
+            const minCandidate = (item.type === '現場排隊' || isOverdueReleasedReservation(item))
               ? runningStart
               : Math.max(runningStart, item.startMinutes);
             const candStart = findEarliestValidStartForReservation(item, minCandidate, scheduledRanges, baseList, currentMin);
@@ -2128,7 +2280,7 @@
         };
 
         const initialTimer = setTimeout(scanTimeout, 800);
-        const timer = setInterval(scanTimeout, 8000);
+        const timer = setInterval(scanTimeout, 3000);
         return () => {
           clearTimeout(initialTimer);
           clearInterval(timer);
@@ -2298,6 +2450,24 @@
 
         const endMin = startMin + duration;
 
+        // NOTE: 只要建立預約/排隊當下就可以開始使用（還沒按開始），立即設為「等候報到」並同步將機台轉為橘色「等待報到」
+        const macCurrentlyBusyOrCheckingIn = baseReservations.some(
+          r => r.machineId === data.machineId && (r.status === '使用中' || r.status === '等候報到' || r.status === '等候提前確認')
+        );
+        const hasOtherWaitersOnMac = baseReservations.some(
+          r => r.machineId === data.machineId && WAITING_RESERVATION_STATUSES.includes(r.status) && !hasReservationStartedOrInUse(r)
+        );
+        const shouldCallImmediately = !macCurrentlyBusyOrCheckingIn && startMin <= currentMin;
+
+        // 樂觀更新（0 毫秒立即變橘色，消除等待網路往返的視覺延遲）
+        if (shouldCallImmediately) {
+          setMachines(prev => prev.map(m =>
+            m.id === data.machineId && m.status !== '使用中'
+              ? { ...m, status: '等待報到', nextUserName: cleanStudents.join(', ') }
+              : m
+          ));
+        }
+
         const payload = {
           machine_id: data.machineId,
           machine_name: targetMac.name,
@@ -2310,17 +2480,24 @@
           end_minutes: endMin,
           start_time_formatted: minutesToTime(startMin),
           end_time_formatted: minutesToTime(endMin),
-          status: '排隊中',
+          status: shouldCallImmediately ? '等候報到' : '排隊中',
+          called_at: shouldCallImmediately ? now.toISOString() : null,
           email: activeUser.mail
         };
 
-        const { error } = await supabaseClient.from('reservations').insert(payload);
+        const [{ error }] = await Promise.all([
+          supabaseClient.from('reservations').insert(payload),
+          shouldCallImmediately
+            ? supabaseClient.from('machines').update({ status: '等待報到' }).eq('id', data.machineId)
+            : Promise.resolve()
+        ]);
         if (error) {
           console.error('Supabase error:', error);
+          await refreshData();
           return { success: false, message: `資料庫儲存失敗：${error.message}` };
         }
 
-        // NOTE: 發送通知給所有名單中的同學（包含發起人本人與所有被加入的小組成員）
+        // NOTE: 發送通知給所有名單中的同學（背景執行不阻塞畫面刷新）
         for (const sName of cleanStudents) {
           const matched = students.find(s => s.name === sName);
           const studentEmail = matched?.mail || (sName === activeUser.name ? activeUser.mail : '');
@@ -2344,8 +2521,9 @@
 
         const latestReservations = await refreshData();
 
-        // NOTE: 若新增的是現場排隊，且機台當前無人使用與等候提前確認，立即評估叫號或更新排隊順序
-        if (data.type === '現場排隊' && latestReservations) {
+        // NOTE: 若同機台尚有其他等候紀錄（例如需重排先前已逾時釋放的保留單），再執行隊列重排；
+        //       若本筆為唯一排隊且已直接設為「等候報到」，則無須重複執行二次查詢與更新。
+        if (data.type === '現場排隊' && latestReservations && (!shouldCallImmediately || hasOtherWaitersOnMac)) {
           const macBusyWithUseOrOffer = latestReservations.some(
             r => r.machineId === data.machineId && (r.status === '使用中' || r.status === '等候提前確認')
           );
@@ -2391,11 +2569,17 @@
           const realMacId = targetRes.machineId || machineId;
           const now = new Date();
           const nowMinutes = now.getHours() * 60 + now.getMinutes();
+          const graceMin = systemSettings?.checkin_grace_minutes !== undefined ? systemSettings.checkin_grace_minutes : 3;
 
-          // NOTE: 前端按鈕已會停用，這裡再擋一次，避免舊畫面或重複點擊繞過規則
+          // NOTE: 前端按鈕已會停用，這裡再擋一次，避免舊畫面或重複點擊繞過規則；
+          //       若點擊者本身已超過報到寬限期且後方有人，當場立即執行逾時順延調換並刷新前端畫面！
           if (!force) {
             const eligibility = getStartEligibility(targetRes, latestList, nowMinutes);
             if (!eligibility.canStart) {
+              if (isCheckinCallExpired(targetRes, graceMin)) {
+                await handleOverdueReservation(targetRes, latestList, nowMinutes, graceMin);
+                await refreshData();
+              }
               alert(`⚠️ 目前無法開始使用\n\n${eligibility.reason}`);
               return;
             }
@@ -2414,6 +2598,31 @@
             called_at: null,
             advance_offered_at: null
           }).eq('id', targetRes.id);
+
+          // NOTE: 若同機台前面尚有已超過 3 分鐘報到期限但尚未被背景輪詢調換的預約，自動將其順延至本筆結束之後並退回「排隊中」
+          const expiredWaitersOnMac = latestList.filter(
+            r => r.machineId === realMacId && r.id !== targetRes.id && isCheckinCallExpired(r, graceMin)
+          );
+          let nextBumpStart = newEndMinutes;
+          for (const expItem of expiredWaitersOnMac) {
+            const expDur = expItem.durationMinutes || Math.max(10, (expItem.endMinutes - expItem.startMinutes) || 10);
+            const expEnd = nextBumpStart + expDur;
+            await supabaseClient
+              .from('reservations')
+              .update({
+                status: '排隊中',
+                type: '現場排隊',
+                start_minutes: nextBumpStart,
+                end_minutes: expEnd,
+                start_time_formatted: minutesToTime(nextBumpStart),
+                end_time_formatted: minutesToTime(expEnd),
+                called_at: null,
+                started_at: null
+              })
+              .eq('id', expItem.id)
+              .in('status', WAITING_RESERVATION_STATUSES);
+            nextBumpStart = expEnd;
+          }
 
           await supabaseClient.from('machines').update({ status: '使用中' }).eq('id', realMacId);
           await refreshData();
@@ -2781,6 +2990,9 @@
           updateSettings,
           reorderMachineQueue,
           shiftReservationTime,
+          handleOverdueReservation,
+          syncStaleWaitingSchedules,
+          advanceQueueForMachine,
           refreshData
         }}>
           {children}
@@ -3652,8 +3864,30 @@
     function MachineDetailView({ machine, onBack, onOpenReservationModal }) {
       const { 
         reservations, 
-        systemSettings
+        systemSettings,
+        handleOverdueReservation,
+        refreshData
       } = useApp();
+
+      const graceMin = systemSettings?.checkin_grace_minutes !== undefined ? systemSettings.checkin_grace_minutes : 3;
+
+      // 當進入詳情頁或預約狀態更新時，若本機台有已超過報到寬限期的預約，立即觸發順延調換並刷新畫面
+      useEffect(() => {
+        const now = new Date();
+        const nowMin = now.getHours() * 60 + now.getMinutes();
+        const expiredRes = (reservations || []).find(
+          r => r.machineId === machine.id && isCheckinCallExpired(r, graceMin)
+        );
+        const hasOtherWaiters = (reservations || []).some(
+          r => r.machineId === machine.id && (!expiredRes || r.id !== expiredRes.id) &&
+               WAITING_RESERVATION_STATUSES.includes(r.status) && !isOverdueReleasedReservation(r) && !isCheckinCallExpired(r, graceMin)
+        );
+        if (expiredRes && hasOtherWaiters && typeof handleOverdueReservation === 'function') {
+          handleOverdueReservation(expiredRes, reservations, nowMin, graceMin).then(swapped => {
+            if (swapped && typeof refreshData === 'function') refreshData();
+          });
+        }
+      }, [machine.id, reservations, graceMin, handleOverdueReservation, refreshData]);
 
       // 檢查是否為當天日期（隔天自動清除歷史紀錄）
       const isToday = (dateStr) => {
@@ -3666,7 +3900,7 @@
                d.getDate() === now.getDate();
       };
 
-      // 取得此機台的當日預約清單（順序：使用過 → 正在使用 → 未來使用）
+      // 取得此機台的當日預約清單（順序：使用過 → 正在使用 → 未來使用；若首位已逾時且後方有候補者，前端即時優先顯示下一位）
       const machineReservations = useMemo(() => {
         // 1. 當天已完成（使用過）
         const completedList = reservations
@@ -3678,12 +3912,22 @@
           .filter(r => r.machineId === machine.id && r.status === '使用中');
 
         // 3. 未來使用（等候報到、等候提前確認、排隊中、等待中）
-        const upcomingList = reservations
-          .filter(r => r.machineId === machine.id && (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中'))
-          .sort((a, b) => a.startMinutes - b.startMinutes);
+        const rawUpcoming = reservations
+          .filter(r => r.machineId === machine.id && (r.status === '等候報到' || r.status === '等候提前確認' || r.status === '排隊中' || r.status === '等待中'));
+        const hasActiveSubstitute = rawUpcoming.some(
+          r => r.type === '現場排隊' && !isOverdueReleasedReservation(r) && !isCheckinCallExpired(r, graceMin)
+        );
+        const upcomingList = rawUpcoming.sort((a, b) => {
+          if (hasActiveSubstitute) {
+            const aExpired = (isCheckinCallExpired(a, graceMin) || isOverdueReleasedReservation(a)) ? 1 : 0;
+            const bExpired = (isCheckinCallExpired(b, graceMin) || isOverdueReleasedReservation(b)) ? 1 : 0;
+            if (aExpired !== bExpired) return aExpired - bExpired;
+          }
+          return a.startMinutes - b.startMinutes;
+        });
 
         return [...completedList, ...inUseList, ...upcomingList];
-      }, [reservations, machine.id]);
+      }, [reservations, machine.id, graceMin]);
 
       // 計算最快可用時段（排除已完成的歷史紀錄）
       const getNextAvailableTime = () => {
@@ -3823,6 +4067,10 @@
                   let subTextClass = "text-xs text-slate-500";
                   let statusBadgeClass = "bg-blue-50 text-blue-600 font-normal";
 
+                  const nowForItem = new Date();
+                  const nowMinForItem = nowForItem.getHours() * 60 + nowForItem.getMinutes();
+                  const isReadyToStartNow = !isCompleted && !isInUse && isReservationReadyToStartNow(res, reservations, nowMinForItem);
+
                   if (isCompleted) {
                     // 1. 使用過的同學：飽和度較低的灰色／灰階顯示
                     rowClass = "bg-slate-50/80 opacity-60 grayscale border-b border-slate-100/60";
@@ -3840,8 +4088,8 @@
                     subTextClass = "text-xs font-bold text-red-600";
                     statusBadgeClass = "bg-red-100 text-red-700 font-black px-2 py-0.5 shadow-2xs";
                   } else {
-                    // 3. 未來使用的同學：一般字體
-                    if (res.status === '等候報到') {
+                    // 3. 未來使用的同學：當下即可開始使用或等候報到皆顯示橘色
+                    if (res.status === '等候報到' || isReadyToStartNow) {
                       statusBadgeClass = "bg-amber-50 text-amber-700 font-semibold border border-amber-200";
                       numBadgeClass = "bg-amber-100 text-amber-800 font-bold";
                       nameClass = "text-sm font-semibold text-slate-900";
@@ -3871,7 +4119,7 @@
                       <div className="text-right">
                         <p className={timeClass}>{res.startTimeFormatted} ～ {res.endTimeFormatted}</p>
                         <span className={`text-[10px] px-1.5 py-0.5 rounded inline-block mt-0.5 ${statusBadgeClass}`}>
-                          {isCompleted ? '已使用' : res.status}
+                          {isCompleted ? '已使用' : (isReadyToStartNow ? '等候報到' : res.status)}
                         </span>
                       </div>
                     </div>
@@ -3966,8 +4214,9 @@
                       {!isInUse ? (
                         <button
                           onClick={() => {
-                            // NOTE: 不用 disabled，讓同學點了能看到「為什麼還不能開始」
-                            if (!eligibility.canStart) {
+                            // NOTE: 不用 disabled，讓同學點了能看到「為什麼還不能開始」；
+                            //       若為叫號逾時則交由 startMachineUsage 立即觸發順延調換並刷新畫面
+                            if (!eligibility.canStart && !isCheckinCallExpired(res, 3)) {
                               alert(`⚠️ 目前無法開始使用\n\n${eligibility.reason}`);
                               return;
                             }
@@ -5532,6 +5781,8 @@
         return () => clearTimeout(hideControlsTimerRef.current);
       }, [revealControls]);
 
+      const nowMin = now.getHours() * 60 + now.getMinutes();
+
       // 各機台卡片資料
       const cards = useMemo(() => {
         return arrangeTvMachines(machines).map(({ machine, parsed, col, row }) => {
@@ -5540,7 +5791,9 @@
             .filter(r => r.machineId === machine.id && TV_UPCOMING_STATUSES.includes(r.status))
             .sort((a, b) => a.startMinutes - b.startMinutes);
 
-          const statusKey = inUse ? 'busy' : machine.status === '等待報到' ? 'waiting' : 'idle';
+          // NOTE: 只要機台狀態為「等待報到」或有「當下即可開始使用但還沒按開始」的預約/排隊，一律顯示橘色「等待中」
+          const readyNowRes = !inUse && upcoming.find(r => isReservationReadyToStartNow(r, reservations, nowMin));
+          const statusKey = inUse ? 'busy' : (machine.status === '等待報到' || readyNowRes) ? 'waiting' : 'idle';
           const title = inUse ? (inUse.students || []).join('、') : statusKey === 'waiting' ? '等待中' : '空閒中';
           const timeText = inUse ? `${inUse.startTimeFormatted}-${inUse.endTimeFormatted}` : '';
           const isMultiple = Boolean(inUse && ((inUse.students || []).length >= 2 || (inUse.students || []).join('、').includes('、')));
@@ -5556,12 +5809,12 @@
             }))
           };
         });
-      }, [machines, reservations]);
+      }, [machines, reservations, nowMin]);
 
-      // 右側「請盡速報到」清單：已被叫號、等待報到的同學
+      // 右側「請盡速報到」清單：已被叫號、或當下即可開始使用但還沒按開始的同學
       const callList = useMemo(() => {
         return reservations
-          .filter(r => r.status === '等候報到')
+          .filter(r => isReservationReadyToStartNow(r, reservations, nowMin))
           .sort((a, b) => a.startMinutes - b.startMinutes)
           .map(r => {
             const machine = machines.find(m => m.id === r.machineId);
@@ -5578,7 +5831,7 @@
               base: parsed.base
             };
           });
-      }, [machines, reservations]);
+      }, [machines, reservations, nowMin]);
 
       const pageCount = Math.max(1, Math.ceil(callList.length / TV_QUEUE_PAGE_SIZE));
       const currentPage = Math.min(pageIndex, pageCount - 1);
