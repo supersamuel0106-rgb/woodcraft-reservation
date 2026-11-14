@@ -2417,8 +2417,13 @@
           }
         }
 
-        // 2. 檢查目前登入帳號（預約發起人）本人的上限
-        if (activeUser?.mail) {
+        // 2. 檢查目前登入帳號（預約發起人）本人的上限（助教透過控制面板代為新增時不套用助教本人上限）
+        const isAdminProxy = Boolean(data.isAdminProxy);
+        const primaryStudentMail = isAdminProxy
+          ? (students.find(s => s.name === cleanStudents[0])?.mail || '')
+          : (activeUser?.mail || '');
+
+        if (!isAdminProxy && activeUser?.mail) {
           const emailResList = baseReservations.filter(r => {
             if (!isReservationActive(r)) return false;
             return r.email && r.email.toLowerCase() === activeUser.mail.toLowerCase();
@@ -2458,7 +2463,7 @@
           startMin = timeToMinutes(slotId);
         } else {
           // 現場排隊推算即時起始時間（檢查本人與所有共同組員準備使用的預約，若卡到則自動往後順延）
-          startMin = calculateDynamicQueueStart(baseReservations, data.machineId, duration, courseEndMin, cleanStudents, activeUser?.mail, currentMin);
+          startMin = calculateDynamicQueueStart(baseReservations, data.machineId, duration, courseEndMin, cleanStudents, primaryStudentMail, currentMin);
           slotId = null; // 現場排隊不綁定 time_slots 外鍵
         }
 
@@ -2469,7 +2474,7 @@
           startMin,
           duration,
           cleanStudents,
-          activeUser?.mail,
+          primaryStudentMail,
           courseEndMin,
           null,
           data.type === '現場排隊' ? currentMin : null
@@ -2512,7 +2517,7 @@
           end_time_formatted: minutesToTime(endMin),
           status: shouldCallImmediately ? '等候報到' : '排隊中',
           called_at: shouldCallImmediately ? now.toISOString() : null,
-          email: activeUser.mail
+          email: primaryStudentMail
         };
 
         const [{ error }] = await Promise.all([
@@ -3469,7 +3474,7 @@
     // ============================================================
     // 6. 新增預約 / 現場排隊 Modal (連動 24h 前時段預約與開課現場排隊限制)
     // ============================================================
-    function ReservationModal({ initialMachineId, onClose }) {
+    function ReservationModal({ initialMachineId, isAdminProxy = false, onClose }) {
       const { machines, students, activeUser, reservations, systemSettings, createReservation } = useApp();
       const effectiveTimes = getEffectiveCourseTimes(systemSettings);
       const phaseInfo = getCurrentBookingPhase(systemSettings);
@@ -3477,7 +3482,7 @@
       const courseStartMin = effectiveTimes.startTime.getHours() * 60 + effectiveTimes.startTime.getMinutes();
       const courseEndMin = effectiveTimes.endTime.getHours() * 60 + effectiveTimes.endTime.getMinutes();
 
-      // 候選名單：過濾掉登入本人，本人必定直接包含在預約名單中
+      // 候選名單：過濾掉登入本人；一般模式下本人必定包含在預約名單中，助教代新增模式則不包含助教本人
       const otherStudents = useMemo(() => {
         return students.filter(s => s.name !== activeUser?.name && s.mail !== activeUser?.mail);
       }, [students, activeUser]);
@@ -3490,12 +3495,15 @@
       const [reservationType, setReservationType] = useState(
         phaseInfo.allowedType === '現場排隊' ? '現場排隊' : '時段預約'
       );
-      const [selectedStudents, setSelectedStudents] = useState([activeUser?.name || '']);
+      const [selectedStudents, setSelectedStudents] = useState(
+        isAdminProxy ? [] : [activeUser?.name || '']
+      );
       const [selectedSlotId, setSelectedSlotId] = useState(minutesToTime(courseStartMin));
       const [isSubmitting, setIsSubmitting] = useState(false);
 
-      // NOTE: 確保登入者本人始終存在於名單首位
+      // NOTE: 一般模式下確保登入者本人始終存在於名單首位；助教透過控制面板代為新增時不加入助教本人
       useEffect(() => {
+        if (isAdminProxy) return;
         if (activeUser?.name) {
           setSelectedStudents(prev => {
             const clean = prev.filter(Boolean);
@@ -3505,11 +3513,11 @@
             return clean;
           });
         }
-      }, [activeUser?.name]);
+      }, [activeUser?.name, isAdminProxy]);
 
       // NOTE: 最少 10 分鐘（1格），最多由學生人數決定（1人最多20分鐘，2人最多30分鐘...）
       const MIN_DURATION = 10;
-      const maxDuration = calculateUsageMinutes(selectedStudents.length);
+      const maxDuration = Math.max(MIN_DURATION, calculateUsageMinutes(selectedStudents.length));
       // 使用者自選的時長 state，預設為最大值，切換學生人數時維持合理範圍
       const [selectedDuration, setSelectedDuration] = useState(maxDuration);
 
@@ -3536,6 +3544,9 @@
       };
 
       // 現場排隊推算：同時檢查本人與所有勾選組員準備使用的預約時段，若卡到自動往後順延
+      const effectiveBookingEmail = isAdminProxy
+        ? (students.find(s => s.name === selectedStudents[0])?.mail || '')
+        : (activeUser?.mail || '');
       const modalNowMin = new Date().getHours() * 60 + new Date().getMinutes();
       const queuePlan = calculateDynamicQueuePlan(
         reservations,
@@ -3543,7 +3554,7 @@
         selectedDuration,
         courseEndMin,
         selectedStudents,
-        activeUser?.mail,
+        effectiveBookingEmail,
         modalNowMin
       );
       const queueStartMin = queuePlan.startMin;
@@ -3557,7 +3568,7 @@
         targetStartMin,
         selectedDuration,
         selectedStudents,
-        activeUser?.mail,
+        effectiveBookingEmail,
         courseEndMin,
         null,
         reservationType === '現場排隊' ? modalNowMin : null
@@ -3572,16 +3583,16 @@
       }, [phaseInfo.phase]);
 
       const toggleStudent = (sName) => {
-        if (sName === activeUser?.name) {
+        if (!isAdminProxy && sName === activeUser?.name) {
           return; // 本人不可取消勾選
         }
         if (selectedStudents.includes(sName)) {
           // 取消勾選組員
           setSelectedStudents(prev => prev.filter(s => s !== sName));
         } else {
-          // 勾選組員：最多只能勾選 4 人（連同本人共 5 人）
+          // 勾選學生：最多 5 人上限
           if (selectedStudents.length >= 5) {
-            alert('⚠️ 最多只能勾選 4 位組員（連同預約本人共 5 人上限）！');
+            alert(isAdminProxy ? '⚠️ 最多只能勾選 5 位同學！' : '⚠️ 最多只能勾選 4 位組員（連同預約本人共 5 人上限）！');
             return;
           }
           setSelectedStudents(prev => [...prev, sName]);
@@ -3592,10 +3603,12 @@
         e.preventDefault();
         if (!selectedMachineId) return alert('請選擇預約機台！');
         
-        // 確保本人一定在名單中
-        const finalStudents = selectedStudents.includes(activeUser?.name)
-          ? selectedStudents
-          : [activeUser?.name, ...selectedStudents];
+        // 一般模式下確保本人一定在名單中；助教透過控制面板代為新增時不包含助教本人
+        const finalStudents = isAdminProxy
+          ? selectedStudents.filter(Boolean)
+          : (selectedStudents.includes(activeUser?.name)
+            ? selectedStudents
+            : [activeUser?.name, ...selectedStudents].filter(Boolean));
 
         if (finalStudents.length === 0) return alert('請至少選擇一位學生！');
 
@@ -3640,7 +3653,8 @@
             students: finalStudents,
             timeSlotId: selectedSlotId,
             // NOTE: 傳入使用者自選的 duration，後端以此為準而非重新計算
-            customDuration: selectedDuration
+            customDuration: selectedDuration,
+            isAdminProxy
           });
           if (!res.success) {
             alert(`❌ 預約失敗：${res.message}`);
@@ -3717,23 +3731,38 @@
                 </button>
               </div>
 
-              {/* 選擇共同組員 */}
+              {/* 選擇共同組員 / 學生名單 */}
               <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">選擇共同組員：</label>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  {isAdminProxy ? '選擇預約／排隊同學：' : '選擇共同組員：'}
+                </label>
 
                 <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200 space-y-2.5">
-                  {/* 預約本人：單行顯示不換行 */}
-                  <div className="bg-blue-50/70 border border-blue-200/80 px-3 py-2 rounded-xl text-xs flex items-center gap-1.5 whitespace-nowrap overflow-hidden">
-                    <span className="text-blue-600 font-bold shrink-0">👤 預約者（本人）：</span>
-                    <span className="font-bold text-slate-900 truncate">{activeUser?.name}</span>
-                  </div>
+                  {isAdminProxy ? (
+                    <div className="bg-amber-50/80 border border-amber-200 px-3 py-2 rounded-xl text-xs flex items-center gap-1.5 whitespace-nowrap overflow-hidden">
+                      <span className="text-amber-700 font-bold shrink-0">👑 控制面板代為新增：</span>
+                      <span className="font-semibold text-slate-700 truncate">不會加入「{activeUser?.name}」</span>
+                    </div>
+                  ) : (
+                    /* 預約本人：單行顯示不換行 */
+                    <div className="bg-blue-50/70 border border-blue-200/80 px-3 py-2 rounded-xl text-xs flex items-center gap-1.5 whitespace-nowrap overflow-hidden">
+                      <span className="text-blue-600 font-bold shrink-0">👤 預約者（本人）：</span>
+                      <span className="font-bold text-slate-900 truncate">{activeUser?.name}</span>
+                    </div>
+                  )}
 
-                  {/* 其他可勾選組員（最多勾選 4 人） */}
+                  {/* 其他可勾選組員 */}
                   <div>
                     <div className="text-[11px] font-semibold text-slate-500 mb-1.5 flex items-center justify-between">
-                      <span>可勾選其他組員（已選 {selectedStudents.length - 1} / 4 人）：</span>
+                      <span>
+                        {isAdminProxy
+                          ? `請勾選同學（已選 ${selectedStudents.length} / 5 人）：`
+                          : `可勾選其他組員（已選 ${selectedStudents.length - 1} / 4 人）：`}
+                      </span>
                       {selectedStudents.length >= 5 && (
-                        <span className="text-amber-600 font-bold text-[10px]">已達 4 位組員上限</span>
+                        <span className="text-amber-600 font-bold text-[10px]">
+                          {isAdminProxy ? '已達 5 位學生上限' : '已達 4 位組員上限'}
+                        </span>
                       )}
                     </div>
                     {otherStudents.length > 0 ? (
@@ -3780,7 +3809,7 @@
                     selectedStartSlot={selectedSlotId}
                     selectedDuration={selectedDuration}
                     selectedStudents={selectedStudents}
-                    userEmail={activeUser?.mail}
+                    userEmail={effectiveBookingEmail}
                     onSelectSlot={handleSelectSlot}
                     onSelectDuration={setSelectedDuration}
                   />
@@ -6127,6 +6156,7 @@
       } = useApp();
       const [isResModalOpen, setIsResModalOpen] = useState(false);
       const [selectedMacId, setSelectedMacId] = useState(null);
+      const [isAdminProxyModal, setIsAdminProxyModal] = useState(false);
       // NOTE: 機台詳情頁切換狀態 —— null 代表列表，有值代表詳情頁
       const [selectedMachine, setSelectedMachine] = useState(null);
       const [isRefreshing, setIsRefreshing] = useState(false);
@@ -6172,8 +6202,9 @@
         }
       }, [isAdmin, activeTab, setActiveTab]);
 
-      const openModal = (id) => {
+      const openModal = (id, adminProxy = false) => {
         setSelectedMacId(id || null);
+        setIsAdminProxyModal(Boolean(adminProxy));
         setIsResModalOpen(true);
       };
 
@@ -6349,7 +6380,7 @@
               )}
               {activeTab === 'reservations' && <MyReservationsView />}
               {isAdmin && activeTab === 'courses' && (
-                <CourseSessionsView onOpenReservationModal={(id) => openModal(id)} onOpenTvDisplay={() => setIsTvMode(true)} />
+                <CourseSessionsView onOpenReservationModal={(id) => openModal(id, true)} onOpenTvDisplay={() => setIsTvMode(true)} />
               )}
               {isAdmin && activeTab === 'settings' && <BookingSettingsView />}
             </div>
@@ -6381,7 +6412,7 @@
           </div>
 
           {isResModalOpen && (
-            <ReservationModal initialMachineId={selectedMacId} onClose={() => setIsResModalOpen(false)} />
+            <ReservationModal initialMachineId={selectedMacId} isAdminProxy={isAdminProxyModal} onClose={() => setIsResModalOpen(false)} />
           )}
         </div>
       );
