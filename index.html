@@ -200,6 +200,8 @@
 
     // 已通知的提醒 ID 集合（防止重複推播，存於 localStorage）
     const NOTIFIED_REMINDERS_KEY = 'wc_notified_reminders_v1';
+    // 記錄已完成順延的暫停時間戳，避免解除暫停失敗重試時重複順延時段
+    const SHIFTED_PAUSE_STORAGE_KEY = 'wc_shifted_pause_at_v1';
 
     // HACK: system_settings 表沒有 course_paused 欄位，且 App 金鑰無法修改資料表結構，
     //       因此另建一列 id='COURSE_PAUSE'，以 manual_course_start_time 存「暫停開始時間」（null=未暫停）。
@@ -1234,6 +1236,8 @@
       //       例如手機鎖屏期間老師按下暫停，喚醒後第一輪掃描仍以為未暫停，會把使用中同學誤判超時而自動結束。
       const isCoursePausedRef = useRef(isCoursePaused);
       isCoursePausedRef.current = isCoursePaused;
+      const shiftedPauseAtRef = useRef(null);
+      const shiftedPauseMetaRef = useRef({ elapsedMin: 0, count: 0 });
 
       const refreshData = useCallback(async () => {
         if (!supabaseClient) return null;
@@ -2722,6 +2726,10 @@
           alert('⚠️ 暫停狀態寫入資料庫失敗，電視與同學手機不會顯示暫停畫面。請檢查網路後再試一次。');
           return { success: false };
         }
+        shiftedPauseAtRef.current = null;
+        try {
+          if (typeof localStorage !== 'undefined') localStorage.removeItem(SHIFTED_PAUSE_STORAGE_KEY);
+        } catch (e) {}
         // 先本機立即生效，其他裝置於下次輪詢同步
         isCoursePausedRef.current = true;
         setRemotePausedAt(pausedAtIso);
@@ -2740,64 +2748,130 @@
       };
 
       const resumeCourse = async () => {
-        const pausedAtStr = coursePausedAt || new Date().toISOString();
-        const pausedAt = new Date(pausedAtStr);
-        const now = new Date();
-        const diffMs = Math.max(0, now.getTime() - pausedAt.getTime());
-        // 向上取整至少 1 分鐘
-        const elapsedMin = Math.max(1, Math.ceil(diffMs / (1000 * 60)));
+        if (!supabaseClient) return { success: false };
 
-        // NOTE: 直接向資料庫取得最新預約，避免本機 state 過期而漏掉暫停期間剛開始使用的同學
-        let sourceList = reservations;
-        const { data: freshRows, error: freshErr } = await supabaseClient.from('reservations').select('*');
-        if (!freshErr && Array.isArray(freshRows)) {
-          sourceList = freshRows.map(mapReservationRow);
-        }
+        // 1. 以資料庫中的暫停時間戳為準；若已被其他裝置解除，直接同步狀態即可
+        let pausedAtStr = coursePausedAt;
+        const { data: pauseRow, error: pauseReadErr } = await supabaseClient
+          .from('system_settings')
+          .select('manual_course_start_time')
+          .eq('id', COURSE_PAUSE_ROW_ID)
+          .maybeSingle();
 
-        // 找出所有需要順延的預約（使用中、等候報到、排隊中、等待中）
-        // 使用中的同學：開始與結束時間一起往後順延暫停分鐘數，狀態維持「使用中」，恢復後自動繼續計時，無須重新按開始
-        const activeList = sourceList.filter(r => 
-          r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中'
-        );
-
-        // 平行送出順延，縮短恢復過程中資料不一致的時間窗
-        await Promise.all(activeList.map(r => {
-          const newStart = r.startMinutes + elapsedMin;
-          const newEnd = r.endMinutes + elapsedMin;
-          const payload = {
-            start_minutes: newStart,
-            end_minutes: newEnd,
-            start_time_formatted: minutesToTime(newStart),
-            end_time_formatted: minutesToTime(newEnd)
-          };
-          // 等候報到的 3 分鐘報到倒數同樣凍結：叫號時間順延，避免恢復瞬間被判定逾時
-          if (r.status === '等候報到' && r.calledAt) {
-            const calledMs = new Date(r.calledAt).getTime();
-            if (!isNaN(calledMs)) payload.called_at = new Date(calledMs + diffMs).toISOString();
+        if (!pauseReadErr) {
+          if (!pauseRow?.manual_course_start_time) {
+            shiftedPauseAtRef.current = null;
+            try {
+              if (typeof localStorage !== 'undefined') localStorage.removeItem(SHIFTED_PAUSE_STORAGE_KEY);
+            } catch (e) {}
+            isCoursePausedRef.current = false;
+            setRemotePausedAt(null);
+            await refreshData();
+            return { success: true, alreadyResumed: true, elapsedMin: 0, count: 0 };
           }
-          return supabaseClient.from('reservations').update(payload).eq('id', r.id).eq('status', r.status);
-        }));
-
-        const ok = await writeCoursePauseState(null);
-        if (!ok) {
-          alert('⚠️ 恢復狀態寫入資料庫失敗，電視與手機可能仍顯示暫停畫面。請再按一次「恢復課程」。');
-        } else {
-          isCoursePausedRef.current = false;
-          setRemotePausedAt(null);
+          pausedAtStr = pauseRow.manual_course_start_time;
+        }
+        if (!pausedAtStr) {
+          pausedAtStr = new Date().toISOString();
         }
 
-        const notif = {
-          id: `N_${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString('zh-TW'),
-          recipientName: '全體師生',
-          machineName: '全機台',
-          subject: '【課程已恢復】時段已自動順延',
-          body: `老師講解結束，課程已恢復！所有進行中與排隊中的預約已自動往後順延 ${elapsedMin} 分鐘。`
-        };
-        setNotifications(prev => [notif, ...prev]);
+        // 2. 冪等檢查：若本次暫停已經順延過預約（上次僅在解除暫停狀態失敗），重試時跳過順延避免重複累加
+        let savedShiftedKey = null;
+        try {
+          if (typeof localStorage !== 'undefined') savedShiftedKey = localStorage.getItem(SHIFTED_PAUSE_STORAGE_KEY);
+        } catch (e) {}
+        const alreadyShifted = shiftedPauseAtRef.current === pausedAtStr || savedShiftedKey === pausedAtStr;
+
+        let elapsedMin = shiftedPauseMetaRef.current.elapsedMin;
+        let shiftedCount = shiftedPauseMetaRef.current.count;
+
+        if (!alreadyShifted) {
+          const pausedAt = new Date(pausedAtStr);
+          const now = new Date();
+          const diffMs = Math.max(0, now.getTime() - pausedAt.getTime());
+          // 向上取整至少 1 分鐘
+          elapsedMin = Math.max(1, Math.ceil(diffMs / (1000 * 60)));
+
+          // NOTE: 直接向資料庫取得最新預約，避免本機 state 過期而漏掉暫停期間剛開始使用的同學
+          const { data: freshRows, error: freshErr } = await supabaseClient.from('reservations').select('*');
+          if (freshErr || !Array.isArray(freshRows)) {
+            alert('⚠️ 無法取得最新預約資料，請檢查網路後再按一次「恢復課程」。');
+            return { success: false };
+          }
+          const sourceList = freshRows.map(mapReservationRow);
+
+          // 找出所有需要順延的預約（使用中、等候報到、排隊中、等待中）
+          // 使用中的同學：開始與結束時間一起往後順延暫停分鐘數，狀態維持「使用中」，恢復後自動繼續計時，無須重新按開始
+          const activeList = sourceList.filter(r => 
+            r.status === '使用中' || r.status === '等候報到' || r.status === '排隊中' || r.status === '等待中'
+          );
+
+          // 平行送出順延，縮短恢復過程中資料不一致的時間窗
+          const updateResults = await Promise.all(activeList.map(r => {
+            const newStart = r.startMinutes + elapsedMin;
+            const newEnd = r.endMinutes + elapsedMin;
+            const payload = {
+              start_minutes: newStart,
+              end_minutes: newEnd,
+              start_time_formatted: minutesToTime(newStart),
+              end_time_formatted: minutesToTime(newEnd)
+            };
+            // 等候報到的 3 分鐘報到倒數同樣凍結：叫號時間順延，避免恢復瞬間被判定逾時
+            if (r.status === '等候報到' && r.calledAt) {
+              const calledMs = new Date(r.calledAt).getTime();
+              if (!isNaN(calledMs)) payload.called_at = new Date(calledMs + diffMs).toISOString();
+            }
+            return supabaseClient.from('reservations').update(payload).eq('id', r.id).eq('status', r.status);
+          }));
+
+          const hasUpdateErr = updateResults.some(res => res && res.error);
+          if (hasUpdateErr) {
+            alert('⚠️ 部分預約順延寫入失敗，請檢查網路後再按一次「恢復課程」。');
+            return { success: false };
+          }
+
+          shiftedCount = activeList.length;
+          shiftedPauseAtRef.current = pausedAtStr;
+          shiftedPauseMetaRef.current = { elapsedMin, count: shiftedCount };
+          try {
+            if (typeof localStorage !== 'undefined') localStorage.setItem(SHIFTED_PAUSE_STORAGE_KEY, pausedAtStr);
+          } catch (e) {}
+        }
+
+        // 3. 解除資料庫暫停狀態（失敗時自動短暫重試 2 次，確保一按就順利搞定）
+        let ok = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          ok = await writeCoursePauseState(null);
+          if (ok) break;
+          if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 350));
+        }
+
+        if (!ok) {
+          alert('⚠️ 預約時段已順延，但解除暫停狀態寫入資料庫失敗。\n請再按一次「恢復課程」完成解除（時段不會重複順延）。');
+          return { success: false };
+        }
+
+        shiftedPauseAtRef.current = null;
+        try {
+          if (typeof localStorage !== 'undefined') localStorage.removeItem(SHIFTED_PAUSE_STORAGE_KEY);
+        } catch (e) {}
+        isCoursePausedRef.current = false;
+        setRemotePausedAt(null);
+
+        if (!alreadyShifted) {
+          const notif = {
+            id: `N_${Date.now()}`,
+            timestamp: new Date().toLocaleTimeString('zh-TW'),
+            recipientName: '全體師生',
+            machineName: '全機台',
+            subject: '【課程已恢復】時段已自動順延',
+            body: `老師講解結束，課程已恢復！所有進行中與排隊中的預約已自動往後順延 ${elapsedMin} 分鐘。`
+          };
+          setNotifications(prev => [notif, ...prev]);
+        }
 
         await refreshData();
-        return { success: true, elapsedMin, count: activeList.length };
+        return { success: true, elapsedMin, count: shiftedCount };
       };
 
       const setCurrentCourseSession = async (sessId) => {
@@ -4350,7 +4424,13 @@
         setIsProcessing(true);
         try {
           const res = await resumeCourse();
-          alert(`✅ 課程已順利恢復！\n\n共將 ${res.count} 筆預約時段自動往後順延 ${res.elapsedMin} 分鐘。`);
+          if (res?.success) {
+            if (res.alreadyResumed) {
+              alert('✅ 課程已順利恢復！');
+            } else {
+              alert(`✅ 課程已順利恢復！\n\n共將 ${res.count} 筆預約時段自動往後順延 ${res.elapsedMin} 分鐘。`);
+            }
+          }
         } finally {
           setIsProcessing(false);
         }
